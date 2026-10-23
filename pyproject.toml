@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hypercache"
+version = "0.1.0"
+description = "The Redis of GPU Memory: A Content-Addressable Distributed KV-Cache Fabric for vLLM, SGLang & TensorRT-LLM"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "HyperCache Contributors"}
+]
+keywords = ["llm", "vllm", "kv-cache", "rdma", "gpudirect", "inference", "prefix-caching", "cuda"]
+dependencies = [
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+]
+
+[project.scripts]
+hypercache = "hypercache.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hypercache*"]
