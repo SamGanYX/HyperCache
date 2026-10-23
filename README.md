@@ -1,203 +1,167 @@
-<div align="center">
+# HyperCache
 
-# ⚡ HyperCache
+Distributed KV-cache management, wire quantization, and relative RoPE block reuse for multi-node LLM inference.
 
-### **The Redis of GPU Memory**
-**A Drop-In, Content-Addressable Distributed KV-Cache Fabric for vLLM, SGLang & TensorRT-LLM**
+## Motivation
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org)
-[![Transport: GPUDirect RDMA | NVLink | TCP-FP8](https://img.shields.io/badge/Transport-GPUDirect_RDMA_%7C_NVLink_%7C_TCP--FP8-76B900.svg?logo=nvidia&logoColor=white)](#the-physics-breaking-the-recompute-threshold)
-[![Engine: vLLM KVConnector](https://img.shields.io/badge/Plugin-vLLM_%7C_SGLang-FF6F00.svg)](#quick-start)
+In multi-turn agent loops, codebase analysis, and RAG workloads, most prompt tokens are shared across requests (system prompts, tool definitions, repository files, and retrieved documents).
 
-*Turn isolated GPU High-Bandwidth Memories (HBM) across your cluster into a unified, content-addressable shared KV-cache fabric—without forking your inference engine or replacing your scheduler.*
+Current serving stacks handle this in one of three ways, each with a specific bottleneck:
 
-</div>
+1. **Local in-engine prefix caching (vLLM APC, SGLang RadixAttention):** Stores KV blocks in a prefix tree in local GPU VRAM. This works well when consecutive requests hit the same worker and fit in HBM. In a multi-node cluster behind a load balancer, a request routed to Node B cannot read KV blocks computed on Node A. Moreover, because prefix trees require exact token-for-token prefix alignment from index 0, reordered RAG chunks (`[Doc A, Doc B]` vs `[Doc B, Doc A]`) miss the cache entirely.
+2. **Disaggregated prefill/decode architectures (Mooncake, DistServe, Splitwise):** Separate prefill nodes from decode nodes and stream KV caches over RDMA. Effective at large scale, but requires replacing the serving runtime and cluster scheduler rather than dropping into an existing vLLM deployment.
+3. **Host-RAM and TCP offloading (LMCache, DeepSpeed-FastGen):** Evicts KV blocks over PCIe to host memory or streams them over standard kernel TCP sockets. The bottleneck here is the recompute break-even threshold: for a 70B model (320 KB/token in BF16), a 16k-token prefix is ~5 GB. Copying 5 GB across PCIe, host memory, and a standard TCP stack takes ~310-530 ms, which is roughly the same time an H100 takes to simply recompute the 16k tokens from scratch (~389 ms).
 
----
-
-## 🚨 The Core Problem: VRAM Saturation & Redundant Prefill
-
-In modern LLM production workloads—**autonomous coding agents, multi-agent loops, and enterprise RAG**—80% to 95% of input tokens are redundant across requests:
-* **System prompts & MCP tool schemas:** `4k–16k tokens` sent on every single turn.
-* **Codebases & repository contexts:** `32k–128k tokens` queried concurrently by parallel subagents.
-* **Multi-turn histories & RAG chunks:** The same enterprise documents retrieved across thousands of users.
-
-Every time a request misses local GPU memory, the inference engine pays the **Redundant Compute Tax**: recalculating self-attention Key-Value ($KV$) matrices across all 80+ transformer layers from scratch.
-
----
-
-## 🔍 What Exists Today (And Where Current Solutions Stop)
-
-| Approach | Examples | What They Do | Where They Stop (The Bottleneck) |
-| :--- | :--- | :--- | :--- |
-| **1. In-Engine Prefix Caching** | vLLM (APC), SGLang (RadixAttention), TensorRT-LLM | Organizes KV tensors into a local prefix tree in GPU VRAM. Skips prefill if an identical prompt hits that *exact* instance. | **Zero cross-node awareness.** If a load balancer sends Request 2 to Node B, it recomputes from scratch. Once 80GB HBM fills up, prefixes are evicted and lost. Furthermore, **re-ordered RAG chunks suffer a 100% cache miss.** |
-| **2. Disaggregated Prefill & Decode** | Mooncake, Splitwise, DistServe | Separates compute-heavy Prefill nodes from bandwidth-heavy Decode nodes, transferring KV caches over RDMA. | **Monolithic lock-in.** Requires ripping out your existing serving stack and adopting a bespoke, end-to-end cluster scheduler rather than a plug-and-play cache layer. |
-| **3. Host-RAM Offloading** | LMCache, DeepSpeed-FastGen | Offloads KV states from GPU HBM down to host CPU RAM or local disk over PCIe and standard networking. | **The Recompute Break-Even Trap.** Bouncing multi-gigabyte tensors through the PCIe bus, host OS memory, and CPU TCP stack takes ~310–530ms for 16k tokens—often slower than simply recomputing them on a modern GPU (~389ms). |
-
----
-
-## 💡 Why HyperCache Cuts Through: "The Redis of GPU Memory"
-
-To win developer adoption, an open-source project shouldn't rewrite vLLM or force teams onto a new cluster scheduler. **HyperCache** acts as a transparent, high-speed memory fabric underneath your existing inference engines:
+HyperCache is designed as an external cache layer ("memcached for KV tensors") that sits underneath existing inference workers.
 
 ```text
                         [ Incoming LLM Request ]
-                                   │
-                     ┌─────────────┴─────────────┐
-                     ▼                           ▼
+                                   |
+                     +-------------+-------------+
+                     |                           |
+                     v                           v
           [ Prompt Tokenizer ]         [ Global Radix / Hash DAG ]
-                     │                  (HMAC-BLAKE2b + Pre-RoPE)
-                     │                           │
-                     │                     Cache Lookup (<200µs)
-                     │                           │
-                     ▼                           ▼
-          ┌─────────────────────┐      ┌─────────────────────┐
-          │  Compute New Suffix │      │  Fetch Shared KV    │
-          │  + 15% CacheBlend   │      │  Prefix Tensors     │
-          └──────────┬──────────┘      └──────────┬──────────┘
-                     │                            │
-                     │                 ┌──────────┴──────────┐
-                     │                 │   GPUDirect RDMA    │
-                     │                 │ (Layer-Wise Overlap)│
-                     │                 └──────────┬──────────┘
-                     ▼                            ▼
-                 ┌────────────────────────────────────┐
-                 │       Decode Generation Loop       │
-                 │   (vLLM / SGLang / TRT-LLM Hook)   │
-                 └────────────────────────────────────┘
+                     |                  (HMAC-BLAKE2b + Modular)
+                     |                           |
+                     |                      Cache Lookup
+                     |                           |
+                     v                           v
+          +---------------------+      +---------------------+
+          |  Compute New Suffix |      |  Fetch Shared KV    |
+          |  + 15% CacheBlend   |      |  Prefix Tensors     |
+          +----------+----------+      +----------+----------+
+                     |                            |
+                     |                 +----------+----------+
+                     |                 |  RDMA / TCP-FP8     |
+                     |                 | (Layer-Wise Overlap)|
+                     |                 +----------+----------+
+                     v                            v
+                 +------------------------------------+
+                 |       Decode Generation Loop       |
+                 |   (vLLM / SGLang / TRT-LLM Hook)   |
+                 +------------------------------------+
 ```
 
-### The 3 Architectural Pillars
+## Core Design
 
-1. **Drop-In Connector Interface (`KVConnector`):**
-   Hooks directly into vLLM’s `KVConnectorBase` and SGLang's cache manager without engine forks. Keep your existing containers, Kubernetes ingress, and OpenAI-compatible APIs.
-2. **GPUDirect RDMA Kernel Bypass + Layer-Wise Pipelining:**
-   Bypasses the host OS, CPU copies, and PCIe round-trips using **InfiniBand / RoCEv2** and **NVLink** (with automatic fallback to a multi-threaded **FP8 Binary TCP Daemon** and **INT4 Disk `.hckv` Store** on standard hardware). Combined with **wire-speed FP8 quantization** and **Layer-Wise CUDA Stream Overlap** (streaming Layer $L+1$ while the GPU computes suffix tokens for Layer $L$), remote KV retrieval stays **17x to 35x faster** than recomputation.
-3. **Decoupled Control Plane & Position-Independent (Relative RoPE) DAG:**
-   * **Exact Causal Prefix Hashing:** Uses tenant-isolated `HMAC-BLAKE2b` chained hashes to prevent cross-tenant timing side-channel attacks.
-   * **Zero-Surgery Relative RoPE Phase Rotation ($SO(2)$ Group Identity):** Because Rotary Position Embeddings satisfy $R(m_{\text{new}}\theta) = R((m_{\text{new}} - m_{\text{old}})\theta)R(m_{\text{old}}\theta)$, HyperCache rotates standard post-RoPE keys cached at `m_old` directly into `m_new` on fetch (`4.77e-07` numerical error)—paired with **15% Layer-0 Divergence-Guided Selective Recompute (CacheBlend)** to preserve cross-chunk attention when RAG documents or code files shift order.
+### 1. Dual-Mode Block Hashing (`hypercache/core/hasher.py`)
 
----
+Standard Transformer self-attention is strictly causal: the K and V tensors at token $i$ depend on every preceding token $0 \dots i-1$. Fuzzy hashing (such as LSH) cannot be used for exact prefix matching without corrupting attention states. HyperCache computes two deterministic 128-bit `BLAKE2b` digests per token block (default 16 or 64 tokens):
 
-## 📊 The Physics: Breaking the Recompute Threshold
+* **Chained Causal Hash (`causal_hash`):**
+  $$H_k = \text{BLAKE2b}_{K_{\text{tenant}}}(\text{"CAUSAL"} \parallel H_{k-1} \parallel \text{tokens}_k)$$
+  Used for exact prefix hits with zero recomputation. If a middle block changes (`[A, B, C]` -> `[A, X, C]`), the chain breaks at `X` and `C` is never falsely matched as an exact causal hit.
+* **Position-Independent Modular Hash (`modular_hash`):**
+  $$M_k = \text{BLAKE2b}_{K_{\text{tenant}}}(\text{"MODULAR"} \parallel \text{tokens}_k)$$
+  Used when a known document or file block appears at a new token offset or after a different predecessor.
 
-A distributed KV cache only wins when $T_{\text{lookup}} + T_{\text{transfer (exposed)}} \ll T_{\text{recompute}}$.
-Here is the break-even comparison for **Llama-3-70B** across 80GB H100 nodes (400Gbps RoCEv2/IB):
+All hashes are keyed by a per-tenant secret derived via `HMAC-SHA256` to prevent cross-tenant timing side-channel attacks (where a user infers whether another tenant has cached a proprietary file by measuring TTFT). An explicit `"public"` namespace is available for global system prompts and shared tool schemas.
 
-| Context Length | Raw BF16 KV Size | GPU Recompute ($T_{\text{recompute}}$) | Host-RAM + TCP Offload (PCIe/CPU Bounce) | **HyperCache (RDMA + FP8 + Layer Overlap)** | Effective TTFT Speedup |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **16k Tokens** | `5.00 GB` | `389 ms` | `530 ms` *(Slower than recompute!)* | **`22.4 ms`** *(Exposed latency)* | **🚀 17.4x Faster** |
-| **32k Tokens** | `10.00 GB` | `942 ms` | `1,049 ms` *(Slower than recompute!)* | **`44.6 ms`** | **🚀 21.1x Faster** |
-| **64k Tokens** | `20.00 GB` | `2,546 ms` | `2,096 ms` *(1.2x)* | **`95.7 ms`** | **🚀 26.6x Faster** |
-| **128k Tokens** | `40.00 GB` | `7,753 ms` | `4,219 ms` *(1.8x)* | **`221.9 ms`** | **🚀 34.9x Faster** |
+### 2. Relative RoPE Phase Rotation Without Model Surgery (`hypercache/core/quantizer.py`)
 
----
+When a cached block is reused at a new token offset $m_{\text{new}}$ instead of its original offset $m_{\text{old}}$, its keys have the wrong Rotary Position Embedding (RoPE) phase angles.
 
-## ⚡ Quick Start (Run Real Verification in 30 Seconds)
+Because 2D RoPE rotations belong to $SO(2)$, they satisfy the group identity:
+$$R(m_{\text{new}} \theta_i) = R((m_{\text{new}} - m_{\text{old}}) \theta_i) \, R(m_{\text{old}} \theta_i)$$
 
-### 1. Install
+This means HyperCache does not need invasive forward-pass hooks to intercept pre-RoPE keys. It takes standard post-RoPE keys directly from the engine's PagedAttention buffer at $m_{\text{old}}$ and rotates each complex coordinate pair by the relative delta $\Delta m = m_{\text{new}} - m_{\text{old}}$ on fetch (`max_err ~ 4.7e-7` in float32).
+
+To account for cross-chunk causal attention drift in layers $1 \dots L$ when chunks are reordered, HyperCache pairs relative RoPE rotation with selective boundary recomputation (`hypercache/core/attention_engine.py`): Layer 0 K/V depends only on token embeddings (making rotated Layer 0 KV exact), and the top ~15% of tokens with the largest Layer-0 hidden-state drift are selectively recomputed through deeper layers (following the CacheBlend approach).
+
+### 3. Wire Quantization and Tiered Storage (`hypercache/core/storage_engine.py`)
+
+Because network and PCIe links are an order of magnitude slower than HBM3e, blocks are compressed before leaving L1:
+
+* **L1 (Active HBM / Working Memory):** Native `FP16` / `BF16`.
+* **L2 (Peer Memory / Pinned Host RAM / Network Wire):** Per-token, per-head dynamic `FP8` (`int8` payload + `fp16` scales), cutting transfer volume by `1.97x` (`>0.9999` cosine similarity vs raw float32).
+* **L3 (NVMe / Disk Spillover):** Symmetric `INT4` bit-packed (2 values per `uint8` byte + `fp16` scales) written to `.hckv` binary block files with a 32-bit `CRC32` frame checksum (`3.88x` compression, `>0.993` cosine similarity).
+
+### 4. Layer-Wise Overlap and Break-Even Physics (`hypercache/transport/fabric.py`)
+
+Waiting for all 80 layers of a 64k-token KV cache (~10 GB in FP8) to transfer before starting prefill leaves the GPU idle. By pipelining transfers layer-by-layer—fetching Layer $l+1$ into a staging buffer while the GPU computes suffix tokens for Layer $l$—most of the wire transfer time is hidden behind active suffix compute.
+
+Modeled break-even comparison for Llama-3-70B across 80GB H100 nodes (400Gbps RoCEv2, ~45.5 GB/s effective):
+
+| Context Length | Raw BF16 KV | Full GPU Recompute | Host-RAM + TCP (Uncompressed) | HyperCache (FP8 + RDMA + Layer Overlap) |
+| :--- | :--- | :--- | :--- | :--- |
+| 16k tokens | 5.00 GB | 389 ms | 530 ms | 22.4 ms |
+| 32k tokens | 10.00 GB | 942 ms | 1,049 ms | 44.6 ms |
+| 64k tokens | 20.00 GB | 2,546 ms | 2,096 ms | 95.7 ms |
+| 128k tokens | 40.00 GB | 7,753 ms | 4,219 ms | 221.9 ms |
+
+## Implementation Status (What is Real vs. Modeled in v0.1)
+
+To keep the repository easy to inspect and test on any machine without requiring an InfiniBand cluster:
+
+* **Implemented and executed locally (zero mocks):**
+  * `hypercache/core/hasher.py`: Chained causal and modular `HMAC-BLAKE2b` block chunker and hasher.
+  * `hypercache/core/quantizer.py`: Per-head `FP8` and bit-packed `INT4` KV quantizer/dequantizer, plus the $SO(2)$ relative RoPE phase rotator.
+  * `hypercache/core/attention_engine.py`: A 4-layer Causal Grouped-Query Attention (GQA) + RoPE Transformer in NumPy that runs end-to-end forward passes on reordered chunks (`[Sys, DocB, DocA, Query]`), comparing ground-truth prefill against naive KV stitching, RoPE-only rotation, and RoPE + 15% selective recomputation.
+  * `hypercache/core/storage_engine.py`: Thread-safe L1 -> L2 (`FP8`) -> L3 (`INT4` `.hckv` disk files with `CRC32` tamper detection) physical tensor storage engine.
+  * `hypercache/transport/tcp_server.py`: Multi-threaded binary TCP socket server and client (`HyperCacheTCPServer` / `HyperCacheTCPClient`) with `TCP_NODELAY` framing that streams compressed KV blocks over the wire and applies relative RoPE shifts on fetch.
+  * `hypercache/core/radix_dag.py`: Thread-safe distributed Radix/modular block directory with LRFU demotion and hot-spot tracking.
+* **Analytical / simulated for cluster capacity planning:**
+  * `hypercache/transport/fabric.py` and `hypercache/cli/auditor.py`: Analytical latency models for 400Gbps RoCEv2/InfiniBand GPUDirect RDMA, NVLink P2P, and H100/A100/B200 prefill compute scaling. Native `ibverbs` / UCX C++ bindings and CUDA stream hooks for vLLM's C++ block manager are planned for v0.2.
+
+## Installation & Usage
+
+Requires Python 3.10+ and `numpy`.
+
 ```bash
 pip install -e .
 ```
 
-### 2. Run the End-to-End Numerical, TCP & Break-Even Benchmark (`hypercache benchmark`)
-Executes a **live 4-layer Causal Grouped-Query Attention (GQA) Transformer** with RoPE and CacheBlend on reordered RAG chunks, tests physical L1 $\rightarrow$ L2 (FP8) $\rightarrow$ L3 (INT4 `.hckv` disk + CRC32) storage, spins up a live `HyperCacheTCPServer` socket daemon, and prints the cluster break-even table:
+### 1. Run the verification and break-even benchmark
+
+Executes the local 4-layer GQA attention verification on reordered chunks, physical L1/L2/L3 `.hckv` disk round-trips, live loopback TCP socket transfers, and prints the cluster break-even table:
 
 ```bash
 python -m hypercache benchmark --gpu h100
 ```
 
-### 3. Run the Zero-Risk CFO / Cluster Audit (`hypercache audit`)
-Point `hypercache audit` at your vLLM prompt logs (or run the built-in 62k-token multi-agent SWE simulation) to compare **Siloed vLLM APC**, **Host-RAM+TCP Offload**, and **HyperCache**:
+Example output:
 
-```bash
-python -m hypercache audit --workload multi-agent-swe --nodes 4 --gpu h100
+```text
+==========================================================================================
+  PART 1: LIVE MEASURED NUMERICAL & SYSTEMS VERIFICATION (EXECUTED LOCALLY)
+==========================================================================================
+  A. Multi-Layer Causal GQA Attention + RoPE on Reordered RAG Chunks [Sys, DocB, DocA, Q]
+     * Naive KV Stitching (No RoPE / No Recompute) : Cosine Sim = 0.7423 (Rel L2 Err: 0.715 -> BROKEN)
+     * Relative RoPE Phase Rotation Only (0% Rec.) : Cosine Sim = 0.9701
+     * HYPERCACHE (RoPE Shift + 15% CacheBlend)    : Cosine Sim = 0.9783 (Rel L2 Err: 0.208 | Saved 85.3% Prefix FLOPs)
+------------------------------------------------------------------------------------------
+  B. Physical Tensor Quantization, L3 Disk Spillover & Live TCP Socket Transport
+     * Relative RoPE Shift Error (Pos 1024 -> 8192): 4.77e-07 (Exact SO(2) identity)
+     * FP8 (E4M3) Wire Quantization                : 1.97x compression | Cosine Sim: 0.999979
+     * INT4 (Grouped) L3 Disk (.hckv + CRC32)      : 3.88x compression | Cosine Sim: 0.993258 (67,653 B on disk)
+     * Live TCP Socket Fetch + On-The-Fly RoPE     : 133,188 B frame in 1.14 ms | Cosine Sim vs GT: 0.999979
+==========================================================================================
 ```
 
-### 4. Launch the Live Fabric Monitor (`hypercache top`)
-```bash
-python -m hypercache top --duration 1.5
-```
+### 2. Run the test suite
 
-### 5. Run the 9-Part Unit, Adversarial & Concurrency Test Suite
+Runs all 9 unit, adversarial, CRC32 tamper detection, multi-threaded TCP concurrency, and GQA attention tests:
+
 ```bash
 python tests/test_hypercache.py
 ```
 
----
+### 3. Audit prompt logs or simulated multi-node workloads
 
-## 🔬 Skeptic's Guide & Technical FAQ (Addressing `r/LocalLLaMA` & Systems Critiques)
+Evaluates cache hit rates and TTFT across Siloed APC, Host-RAM+TCP offload, and HyperCache on a JSONL log file (or a built-in multi-agent / RAG workload):
 
-<details>
-<summary><b>Q1: "Wait—is this repo just a math simulator, or does it execute real tensor quantization, attention, disk I/O, and network transfers?"</b></summary>
-
-<br>
-
-**Both are explicitly separated so you can verify everything on a laptop while modeling 400Gbps RDMA clusters:**
-* **100% Real Local Execution (`attention_engine.py`, `quantizer.py`, `storage_engine.py`, `tcp_server.py`):**
-  * Runs real multi-layer **Causal Grouped-Query Attention (GQA) + RoPE + SwiGLU/MLP** forward passes (`MiniGQATransformer`) proving that naive KV stitching fails (`0.742` cosine sim) while Relative RoPE Rotation + 15% Layer-0 Guided CacheBlend recovers `0.978+` contextual delta similarity (`>0.996` full hidden state similarity) while saving `85.3%` of prefix FLOPs.
-  * Performs real `FP8_E4M3` (`1.97x` compression, `0.999979` cosine sim) and `INT4_GROUP` bit-packed (`3.88x` compression, `0.9932` cosine sim) tensor quantization.
-  * Writes real CRC32-protected binary `.hckv` files to L3 disk (`PhysicalTieredStorageEngine`) and streams compressed KV frames over live TCP sockets (`HyperCacheTCPServer` / `HyperCacheTCPClient`) across concurrent threads.
-* **Cluster Hardware Physics Model (`fabric.py`, `auditor.py`):**
-  * Models 400Gbps RoCEv2 / InfiniBand GPUDirect RDMA (`45.5 GB/s`), NVLink (`450 GB/s`), and H100/A100/B200 prefill scaling for multi-node capacity planning.
-</details>
-
-<details>
-<summary><b>Q2: "Why not use Locality-Sensitive Hashing (LSH) to match 'similar' prompts?"</b></summary>
-
-<br>
-
-Because standard Transformer self-attention is strictly causal and path-dependent: changing a single token at index 50 alters the $K$ and $V$ representations of tokens $51\dots N$ in every downstream layer. Fuzzy hashing (LSH) on raw tokens corrupts exact causal prefixes. Instead, HyperCache uses **Dual-Mode Deterministic Hashing** (`BlockHasher`):
-1. **`causal_hash`:** Chained `HMAC-BLAKE2b(tenant_key, parent_hash || block_tokens)` for bit-exact prefix equivalence. If a middle block changes (`[A, B, C]` $\rightarrow$ `[A, X, C]`), the causal chain immediately breaks at `X` (verified in `test_adversarial_middle_block_mutation_breaks_causal_chain`).
-2. **`modular_hash`:** Position-independent `HMAC-BLAKE2b` chunk hash paired with relative RoPE phase rotation and 15% selective boundary recomputation.
-</details>
-
-<details>
-<summary><b>Q3: "Doesn't reusing KV blocks at a new token offset require modifying the model to save Pre-RoPE keys?"</b></summary>
-
-<br>
-
-**No!** Because 2D Rotary Position Embeddings belong to the orthogonal group $SO(2)$, they obey:
-$$R(m_{\text{new}}\theta_i) = R\big((m_{\text{new}} - m_{\text{old}})\theta_i\big) R(m_{\text{old}}\theta_i)$$
-This means HyperCache can take **standard post-RoPE keys** directly from vLLM's existing PagedAttention buffer at offset $m_{\text{old}}$ and rotate them into offset $m_{\text{new}}$ in a single pass using only the relative shift $\Delta m = m_{\text{new}} - m_{\text{old}}$.
-</details>
-
-<details>
-<summary><b>Q4: "Doesn't global KV deduplication create a cross-tenant timing side-channel attack?"</b></summary>
-
-<br>
-
-**Yes—if you use unkeyed hashes.** In a naive global cache, Tenant B can test if Tenant A uploaded a proprietary codebase by checking whether TTFT drops from `2,500ms` to `100ms`. HyperCache prevents this by keying every block hash with a per-tenant HMAC (`HMAC_SHA256(cluster_secret, tenant_id)`), while allowing an explicit `"public"` namespace for shared system prompts and open-source tool schemas.
-</details>
-
----
-
-## 🏗️ Repository Architecture
-
-```text
-HyperCache/
-├── hypercache/
-│   ├── core/
-│   │   ├── hasher.py            # HMAC-BLAKE2b causal prefix + modular block hasher
-│   │   ├── quantizer.py         # Wire-speed FP8 (E4M3) & INT4 KV quantizer + SO(2) RoPE rotator
-│   │   ├── attention_engine.py  # Real multi-layer Causal GQA + RoPE + CacheBlend verification engine
-│   │   ├── storage_engine.py    # Thread-safe L1 (FP16) -> L2 (FP8) -> L3 (INT4 .hckv Disk + CRC32)
-│   │   └── radix_dag.py         # Decoupled Control Plane: Distributed Radix DAG & LRFU directory
-│   ├── transport/
-│   │   ├── fabric.py            # GPUDirect RDMA, NVLink, Pinned DMA & Layer-Wise overlap scheduler
-│   │   └── tcp_server.py        # Multi-threaded binary TCP KV-block daemon & client (`hypercached`)
-│   ├── integrations/
-│   │   └── vllm_connector.py    # Drop-in vLLM KVConnector interface & SGLang adapter
-│   └── cli/
-│       ├── main.py              # Unified CLI (`audit`, `top`, `benchmark`)
-│       ├── auditor.py           # Zero-risk prompt log analyzer & CFO ROI report generator
-│       └── top.py               # Live terminal dashboard for cluster memory & RDMA telemetry
-├── benchmarks/
-│   └── break_even_benchmark.py  # End-to-end numerical verification & RDMA break-even suite
-└── tests/
-    └── test_hypercache.py       # 9-part unit, adversarial, CRC32 tamper, TCP concurrency & GQA tests
+```bash
+python -m hypercache audit --workload multi-agent-swe --nodes 4 --gpu h100
+# Or replay your own prompt logs:
+python -m hypercache audit --log-file requests.jsonl --nodes 4 --gpu h100
 ```
 
-## 📜 License
-Apache 2.0
+### 4. Terminal telemetry view
+
+```bash
+python -m hypercache top --duration 1.5
+```
+
+## License
+
+MIT

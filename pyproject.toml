@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hypercache"
 version = "0.1.0"
-description = "The Redis of GPU Memory: A Content-Addressable Distributed KV-Cache Fabric for vLLM, SGLang & TensorRT-LLM"
+description = "Distributed KV-cache block directory, wire quantization, and relative RoPE reuse for LLM inference"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "Apache-2.0"}
+license = {text = "MIT"}
 authors = [
     {name = "HyperCache Contributors"}
 ]
