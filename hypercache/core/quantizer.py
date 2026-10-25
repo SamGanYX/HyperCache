@@ -26,6 +26,24 @@ class KVQuantMode(str, Enum):
     INT4_GROUP = "int4" # 0.5 bytes / elem  (3.8x wire & memory compression with scales)
 
 
+class RoPEScalingType(str, Enum):
+    DEFAULT = "default"
+    LINEAR = "linear"
+    YARN = "yarn"
+
+
+@dataclass
+class RoPEScalingConfig:
+    """Configuration for extended-context RoPE scaling protocols (YaRN, Linear)."""
+
+    scaling_type: RoPEScalingType = RoPEScalingType.DEFAULT
+    factor: float = 1.0
+    original_max_position_embeddings: int = 8192
+    beta_fast: float = 32.0
+    beta_slow: float = 1.0
+    mscale: float = 1.0
+
+
 @dataclass
 class QuantizedKVBuffer:
     """Compressed representation of a KV-cache block ready for RDMA or L2/L3 storage."""
@@ -183,14 +201,45 @@ class RoPEPhaseRotator:
     can be reused at an arbitrary new prompt offset `m_new`.
     """
 
-    def __init__(self, head_dim: int = 128, rope_theta: float = 500000.0) -> None:
+    def __init__(
+        self,
+        head_dim: int = 128,
+        rope_theta: float = 500000.0,
+        scaling_config: Optional[RoPEScalingConfig] = None,
+    ) -> None:
         if head_dim % 2 != 0:
             raise ValueError("head_dim must be divisible by 2 for RoPE rotation.")
         self.head_dim = head_dim
         self.rope_theta = rope_theta
-        # inv_freq shape: (head_dim // 2,)
+        self.scaling_config = scaling_config or RoPEScalingConfig()
+
         dim_indices = np.arange(0, head_dim, 2, dtype=np.float64)
-        self.inv_freq = 1.0 / (rope_theta ** (dim_indices / head_dim))
+        base_inv_freq = 1.0 / (rope_theta ** (dim_indices / head_dim))
+
+        cfg = self.scaling_config
+        if cfg.scaling_type == RoPEScalingType.DEFAULT:
+            self.inv_freq = base_inv_freq
+        elif cfg.scaling_type == RoPEScalingType.LINEAR:
+            factor = max(1e-4, cfg.factor)
+            self.inv_freq = base_inv_freq / factor
+        elif cfg.scaling_type == RoPEScalingType.YARN:
+            factor = max(1e-4, cfg.factor)
+            wavelengths = 2.0 * np.pi / base_inv_freq
+            low_bound = cfg.beta_slow * cfg.original_max_position_embeddings
+            high_bound = cfg.beta_fast * cfg.original_max_position_embeddings
+
+            # Smooth interpolation ramp between low and high wavelengths
+            # For wavelength < low_bound (high frequency), ramp is 0 (no interpolation)
+            # For wavelength > high_bound (low frequency), ramp is 1 (full factor interpolation)
+            ramp = np.clip(
+                (wavelengths - low_bound) / max(1.0, high_bound - low_bound),
+                0.0,
+                1.0,
+            )
+            yarn_inv_freq = (1.0 - ramp) * base_inv_freq + ramp * (base_inv_freq / factor)
+            self.inv_freq = yarn_inv_freq * cfg.mscale
+        else:
+            self.inv_freq = base_inv_freq
 
     def apply_absolute_rope(self, k_pre_rope: np.ndarray, start_pos: int = 0) -> np.ndarray:
         """

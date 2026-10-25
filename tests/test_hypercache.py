@@ -64,17 +64,26 @@ def test_adversarial_middle_block_mutation_breaks_causal_chain() -> None:
 
 
 def test_relative_rope_phase_rotation_exactness() -> None:
+    from hypercache.core.quantizer import RoPEScalingConfig, RoPEScalingType
+
     rng = np.random.default_rng(123)
     k_pre_rope = rng.standard_normal((2, 16, 8, 128), dtype=np.float32)
-    rotator = RoPEPhaseRotator(head_dim=128)
 
-    k_pos_512 = rotator.apply_absolute_rope(k_pre_rope, start_pos=512)
-    k_pos_4096_expected = rotator.apply_absolute_rope(k_pre_rope, start_pos=4096)
-    k_pos_4096_shifted = rotator.shift_positions(
-        k_pos_512, old_start_pos=512, new_start_pos=4096
-    )
+    # Test across Standard, Linear, and YaRN long-context scaling configs
+    configs = [
+        RoPEScalingConfig(scaling_type=RoPEScalingType.DEFAULT),
+        RoPEScalingConfig(scaling_type=RoPEScalingType.LINEAR, factor=8.0),
+        RoPEScalingConfig(scaling_type=RoPEScalingType.YARN, factor=16.0, original_max_position_embeddings=8192),
+    ]
 
-    np.testing.assert_allclose(k_pos_4096_shifted, k_pos_4096_expected, atol=1e-5)
+    for cfg in configs:
+        rotator = RoPEPhaseRotator(head_dim=128, scaling_config=cfg)
+        k_pos_512 = rotator.apply_absolute_rope(k_pre_rope, start_pos=512)
+        k_pos_4096_expected = rotator.apply_absolute_rope(k_pre_rope, start_pos=4096)
+        k_pos_4096_shifted = rotator.shift_positions(
+            k_pos_512, old_start_pos=512, new_start_pos=4096
+        )
+        np.testing.assert_allclose(k_pos_4096_shifted, k_pos_4096_expected, atol=1e-5)
 
 
 def test_fp8_and_int4_kv_quantization_compression() -> None:
