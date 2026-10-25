@@ -141,9 +141,11 @@ Example output:
 ==========================================================================================
 ```
 
+![Terminal Benchmark](assets/benchmark.png)
+
 ### 2. Run the test suite
 
-Runs all 9 unit, adversarial, CRC32 tamper detection, multi-threaded TCP concurrency, and GQA attention tests:
+Runs all 11 unit, adversarial, CRC32 tamper detection, multi-threaded TCP concurrency, async watermark eviction, and GQA attention tests:
 
 ```bash
 python tests/test_hypercache.py
