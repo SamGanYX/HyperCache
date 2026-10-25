@@ -151,6 +151,34 @@ def test_physical_l1_l2_l3_disk_storage_and_crc32_tamper_detection() -> None:
         engine.close()
 
 
+def test_physical_storage_async_watermark_eviction() -> None:
+    import time
+    rng = np.random.default_rng(42)
+    k = rng.standard_normal((1, 8, 2, 64), dtype=np.float32)
+    v = rng.standard_normal((1, 8, 2, 64), dtype=np.float32)
+
+    # 10 blocks capacity, triggers background eviction at 8 blocks (80%), drains down to 5 (50%)
+    engine = PhysicalTieredStorageEngine(
+        l1_max_blocks=10,
+        l2_max_blocks=20,
+        high_watermark_ratio=0.8,
+        low_watermark_ratio=0.5,
+        enable_async_eviction=True,
+    )
+    try:
+        for i in range(9):
+            engine.put_block(f"async-blk-{i}", k, v, cached_start_pos=i * 8)
+
+        # Allow background evictor to drain
+        time.sleep(0.15)
+        with engine._lock:
+            # L1 should have been proactively drained to <= 5 blocks (low watermark)
+            assert len(engine._l1_store) <= 5, f"L1 count should be <= 5, got {len(engine._l1_store)}"
+            assert engine.l1_to_l2_demotions >= 4
+    finally:
+        engine.close()
+
+
 def test_live_tcp_socket_server_and_concurrent_clients_with_rope_shift() -> None:
     rng = np.random.default_rng(77)
     rotator = RoPEPhaseRotator(head_dim=64)
@@ -333,6 +361,7 @@ if __name__ == "__main__":
         test_relative_rope_phase_rotation_exactness,
         test_fp8_and_int4_kv_quantization_compression,
         test_physical_l1_l2_l3_disk_storage_and_crc32_tamper_detection,
+        test_physical_storage_async_watermark_eviction,
         test_live_tcp_socket_server_and_concurrent_clients_with_rope_shift,
         test_real_multilayer_causal_gqa_attention_reordered_rag_cacheblend,
         test_l1_to_l2_to_l3_demotion_and_cross_node_rdma_hit,

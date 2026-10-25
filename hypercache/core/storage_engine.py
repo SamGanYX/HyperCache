@@ -55,9 +55,15 @@ class PhysicalTieredStorageEngine:
         l1_max_blocks: int = 32,
         l2_max_blocks: int = 128,
         l3_storage_dir: Optional[Path] = None,
+        high_watermark_ratio: float = 0.85,
+        low_watermark_ratio: float = 0.70,
+        enable_async_eviction: bool = False,
     ) -> None:
         self.l1_max_blocks = max(1, l1_max_blocks)
         self.l2_max_blocks = max(1, l2_max_blocks)
+        self.high_watermark_ratio = high_watermark_ratio
+        self.low_watermark_ratio = low_watermark_ratio
+        self.enable_async_eviction = enable_async_eviction
         self._temp_dir: Optional[tempfile.TemporaryDirectory[str]] = None
         if l3_storage_dir is None:
             self._temp_dir = tempfile.TemporaryDirectory(prefix="hypercache_l3_")
@@ -67,6 +73,10 @@ class PhysicalTieredStorageEngine:
             self.l3_dir.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.RLock()
+        self._eviction_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._eviction_thread: Optional[threading.Thread] = None
+
         # L1 LRU: block_hash -> (k_fp16, v_fp16, cached_start_pos)
         self._l1_store: OrderedDict[str, tuple[np.ndarray, np.ndarray, int]] = OrderedDict()
         # L2 LRU: block_hash -> QuantizedKVBuffer (FP8_E4M3)
@@ -79,6 +89,34 @@ class PhysicalTieredStorageEngine:
         self.l3_hits = 0
         self.l1_to_l2_demotions = 0
         self.l2_to_l3_demotions = 0
+
+        if self.enable_async_eviction:
+            self._eviction_thread = threading.Thread(
+                target=self._background_eviction_loop,
+                name="hypercache-async-evictor",
+                daemon=True,
+            )
+            self._eviction_thread.start()
+
+    def _background_eviction_loop(self) -> None:
+        """Asynchronous daemon that proactively drains L1 and L2 down to low watermarks."""
+        while not self._stop_event.is_set():
+            self._eviction_event.wait(timeout=0.1)
+            self._eviction_event.clear()
+            self.reclaim_below_watermarks()
+
+    def reclaim_below_watermarks(self) -> None:
+        """Proactively reclaims L1 and L2 down to their configured low-watermark levels."""
+        with self._lock:
+            l1_target = int(self.l1_max_blocks * self.low_watermark_ratio)
+            while len(self._l1_store) > l1_target:
+                victim_hash, (vk, vv, vpos) = self._l1_store.popitem(last=False)
+                self._demote_to_l2(victim_hash, vk, vv, vpos)
+
+            l2_target = int(self.l2_max_blocks * self.low_watermark_ratio)
+            while len(self._l2_store) > l2_target:
+                victim_hash, victim_buf = self._l2_store.popitem(last=False)
+                self._demote_to_l3_disk(victim_hash, victim_buf)
 
     def put_block(
         self,
@@ -102,6 +140,8 @@ class PhysicalTieredStorageEngine:
                 v_tensor.astype(np.float16, copy=True),
                 cached_start_pos,
             )
+            if self.enable_async_eviction and len(self._l1_store) >= int(self.l1_max_blocks * self.high_watermark_ratio):
+                self._eviction_event.set()
 
     def _demote_to_l2(
         self,
@@ -313,6 +353,11 @@ class PhysicalTieredStorageEngine:
         )
 
     def close(self) -> None:
+        self._stop_event.set()
+        self._eviction_event.set()
+        if self._eviction_thread is not None:
+            self._eviction_thread.join(timeout=1.0)
+            self._eviction_thread = None
         if self._temp_dir is not None:
             self._temp_dir.cleanup()
             self._temp_dir = None
