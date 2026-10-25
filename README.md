@@ -1,5 +1,8 @@
 # HyperCache
 
+[![CI](https://github.com/SamGanYX/HyperCache/actions/workflows/ci.yml/badge.svg)](https://github.com/SamGanYX/HyperCache/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Distributed KV-cache management, wire quantization, and relative RoPE block reuse for multi-node LLM inference.
 
 ## Motivation
