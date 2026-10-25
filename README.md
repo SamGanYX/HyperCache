@@ -165,6 +165,14 @@ python -m hypercache audit --log-file requests.jsonl --nodes 4 --gpu h100
 python -m hypercache top --duration 1.5
 ```
 
+### 5. Run the transparent OpenAI-compatible reverse proxy
+
+Intercepts `/v1/chat/completions` and `/v1/completions`, queries prefix blocks against the global Radix DAG, forwards to upstream vLLM/Ollama, and injects `x-hypercache-*` telemetry headers:
+
+```bash
+python -m hypercache proxy --port 8000 --upstream http://127.0.0.1:8080
+```
+
 ## License
 
 MIT

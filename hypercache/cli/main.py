@@ -90,6 +90,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="GPU hardware profile (default: h100)",
     )
 
+    # 4. `hypercache proxy`
+    p_proxy = sub.add_parser(
+        "proxy",
+        help="Start the transparent OpenAI-compatible prefix caching reverse proxy",
+    )
+    p_proxy.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host address to bind the proxy server to (default: 127.0.0.1)",
+    )
+    p_proxy.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to bind the proxy server to (default: 8000)",
+    )
+    p_proxy.add_argument(
+        "--upstream",
+        default="http://127.0.0.1:8080",
+        help="Upstream inference server URL (default: http://127.0.0.1:8080)",
+    )
+    p_proxy.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose access logging",
+    )
+
     return parser
 
 
@@ -122,6 +149,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if cmd == "benchmark":
         run_break_even_benchmark(gpu_profile=args.gpu)
+        return 0
+
+    if cmd == "proxy":
+        from hypercache.proxy.server import HyperCacheProxyServer
+
+        host = getattr(args, "host", "127.0.0.1")
+        port = getattr(args, "port", 8000)
+        upstream = getattr(args, "upstream", "http://127.0.0.1:8080")
+        verbose = getattr(args, "verbose", False)
+
+        print(f"Starting HyperCache Proxy on http://{host}:{port}")
+        print(f"Forwarding to upstream engine at {upstream}")
+        print("Telemetry headers attached: x-hypercache-hit-tokens, x-hypercache-tier, x-hypercache-est-saved-ms")
+        server = HyperCacheProxyServer(
+            host=host,
+            port=port,
+            upstream_url=upstream,
+            verbose=verbose,
+        )
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down HyperCache Proxy...")
+            server.stop()
         return 0
 
     parser.print_help()

@@ -16,6 +16,7 @@ from hypercache.integrations.vllm_connector import (
     HyperCacheConfig,
     HyperCacheVLLMConnector,
 )
+from hypercache.proxy.server import HyperCacheProxyServer
 from hypercache.transport.tcp_server import HyperCacheTCPClient, HyperCacheTCPServer
 
 
@@ -241,6 +242,81 @@ def test_vllm_connector_reordered_rag_chunks_and_break_even_speedup() -> None:
     assert res2.exposed_latency_ms < res2.legacy_host_tcp_ms
 
 
+def test_proxy_transparent_interception_and_telemetry_headers() -> None:
+    import json
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    import urllib.request
+
+    # Spin up mock upstream server
+    class MockUpstreamHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", 0))
+            _ = self.rfile.read(length)
+            resp = json.dumps({"id": "chatcmpl-test", "choices": [{"message": {"content": "ok"}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+    upstream = HTTPServer(("127.0.0.1", 0), MockUpstreamHandler)
+    up_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    up_thread.start()
+    up_port = upstream.server_address[1]
+
+    # Spin up HyperCache proxy pointing to mock upstream
+    proxy = HyperCacheProxyServer(
+        host="127.0.0.1",
+        port=0,
+        upstream_url=f"http://127.0.0.1:{up_port}",
+    )
+    proxy.start_background()
+    proxy_port = proxy.server_address[1]
+
+    try:
+        req_body = json.dumps({
+            "model": "meta-llama/Llama-3-70B-Instruct",
+            "messages": [
+                {"role": "system", "content": "You are a helpful coding assistant specialized in distributed caching."},
+                {"role": "user", "content": "Explain KV-cache prefix deduplication across GPU nodes."},
+            ]
+        }).encode("utf-8")
+
+        # Turn 1: Initial request (populates DAG)
+        req1 = urllib.request.Request(
+            f"http://127.0.0.1:{proxy_port}/v1/chat/completions",
+            data=req_body,
+            headers={"Content-Type": "application/json", "X-Tenant-ID": "test-org"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req1, timeout=5.0) as resp1:
+            assert resp1.status == 200
+            assert "x-hypercache-hit-tokens" in resp1.headers
+
+        # Turn 2: Exact prompt повторился -> Must hit cache!
+        req2 = urllib.request.Request(
+            f"http://127.0.0.1:{proxy_port}/v1/chat/completions",
+            data=req_body,
+            headers={"Content-Type": "application/json", "X-Tenant-ID": "test-org"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req2, timeout=5.0) as resp2:
+            assert resp2.status == 200
+            hit_tokens = int(resp2.headers.get("x-hypercache-hit-tokens", 0))
+            assert hit_tokens > 0, "Second identical request through proxy must hit HyperCache DAG!"
+
+        # Verify /v1/hypercache/stats endpoint
+        req_stats = urllib.request.Request(f"http://127.0.0.1:{proxy_port}/v1/hypercache/stats")
+        with urllib.request.urlopen(req_stats, timeout=5.0) as resp_s:
+            stats = json.loads(resp_s.read().decode())
+            assert stats["total_queries"] >= 2
+    finally:
+        proxy.stop()
+        upstream.shutdown()
+        upstream.server_close()
+
+
 if __name__ == "__main__":
     test_fns = [
         test_causal_chain_vs_modular_hash_and_tenant_isolation,
@@ -252,6 +328,7 @@ if __name__ == "__main__":
         test_real_multilayer_causal_gqa_attention_reordered_rag_cacheblend,
         test_l1_to_l2_to_l3_demotion_and_cross_node_rdma_hit,
         test_vllm_connector_reordered_rag_chunks_and_break_even_speedup,
+        test_proxy_transparent_interception_and_telemetry_headers,
     ]
     for fn in test_fns:
         fn()
