@@ -75,6 +75,37 @@ class QuantizedKVBuffer:
     def compression_ratio(self) -> float:
         return self.raw_bf16_bytes / max(1, self.compressed_bytes)
 
+    def slice_tokens(self, start_token: int, num_tokens: int) -> QuantizedKVBuffer:
+        """
+        Slices a subset of tokens [start_token .. start_token + num_tokens] from the buffer
+        without full dequantization, enabling sub-block cache reuse.
+        """
+        if start_token < 0 or num_tokens <= 0:
+            raise ValueError("Invalid slice parameters.")
+        end_token = start_token + num_tokens
+        new_shape = list(self.original_shape)
+        new_shape[-3] = num_tokens
+
+        sliced_k = np.ascontiguousarray(self.packed_k[..., start_token:end_token, :, :])
+        sliced_v = np.ascontiguousarray(self.packed_v[..., start_token:end_token, :, :])
+
+        if self.scale_k.ndim >= 3 and self.scale_k.shape[-3] > 1:
+            sliced_sk = np.ascontiguousarray(self.scale_k[..., start_token:end_token, :, :])
+            sliced_sv = np.ascontiguousarray(self.scale_v[..., start_token:end_token, :, :])
+        else:
+            sliced_sk = self.scale_k.copy()
+            sliced_sv = self.scale_v.copy()
+
+        return QuantizedKVBuffer(
+            mode=self.mode,
+            packed_k=sliced_k,
+            packed_v=sliced_v,
+            scale_k=sliced_sk,
+            scale_v=sliced_sv,
+            original_shape=tuple(new_shape),
+            cached_start_pos=self.cached_start_pos + start_token,
+        )
+
 
 class KVQuantizer:
     """
@@ -84,6 +115,16 @@ class KVQuantizer:
     """
 
     FP8_MAX = 448.0  # Standard IEEE / OCP FP8 E4M3 max normal value
+
+    @staticmethod
+    def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+        """Computes numerical cosine similarity between two tensors."""
+        a_f = a.reshape(-1).astype(np.float64)
+        b_f = b.reshape(-1).astype(np.float64)
+        dot = np.dot(a_f, b_f)
+        norm_a = np.linalg.norm(a_f)
+        norm_b = np.linalg.norm(b_f)
+        return float(dot / max(1e-12, norm_a * norm_b))
 
     @classmethod
     def quantize(

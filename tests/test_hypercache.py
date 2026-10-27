@@ -126,6 +126,14 @@ def test_fp8_and_int4_kv_quantization_compression() -> None:
     cos_sim_i4 = float(np.sum(k * k_i4) / (np.linalg.norm(k) * np.linalg.norm(k_i4)))
     assert cos_sim_i4 > 0.985
 
+    # Test zero-copy sub-block slicing (slice first 16 tokens out of 32)
+    fp8_slice = fp8_buf.slice_tokens(start_token=0, num_tokens=16)
+    assert fp8_slice.original_shape == (1, 16, 8, 128)
+    k_slice_rec, _ = KVQuantizer.dequantize(fp8_slice)
+    assert k_slice_rec.shape == (1, 16, 8, 128)
+    cos_sim_slice = KVQuantizer.cosine_similarity(k[:, :16], k_slice_rec)
+    assert cos_sim_slice > 0.999
+
 
 def test_physical_l1_l2_l3_disk_storage_and_crc32_tamper_detection() -> None:
     rng = np.random.default_rng(2025)
