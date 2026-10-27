@@ -52,13 +52,23 @@ class HyperCacheProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self) -> None:
-        if self.path == "/v1/hypercache/health":
+        if self.path in ("/v1/hypercache/health", "/healthz"):
             self._send_json_response(200, {"status": "ok", "version": "0.1.0"})
             return
 
         if self.path == "/v1/hypercache/stats":
             stats = self.server.get_stats()
             self._send_json_response(200, stats)
+            return
+
+        if self.path in ("/metrics", "/v1/metrics"):
+            metrics_text = self.server.export_prometheus_metrics()
+            payload = metrics_text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
             return
 
         # Forward any other GET request upstream
@@ -175,6 +185,13 @@ class HyperCacheProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(resp_data)
 
+                # Record Prometheus metrics
+                self.server.record_completion(
+                    cached_tokens=plan.total_cached_tokens,
+                    total_tokens=plan.total_tokens,
+                    saved_ms=breakdown.saved_ms,
+                )
+
         except urllib.error.HTTPError as e:
             err_data = e.read()
             self.send_response(e.code)
@@ -263,6 +280,57 @@ class HyperCacheProxyServer(socketserver.ThreadingMixIn, HTTPServer):
         self.dag = dag or GlobalRadixDAG(hasher=BlockHasher(block_size=16))
         self.fabric = fabric or KernelBypassFabric()
         self._thread: Optional[threading.Thread] = None
+
+        self._metrics_lock = threading.Lock()
+        self._cached_tokens_total = 0
+        self._prompt_tokens_total = 0
+        self._saved_ms_total = 0.0
+
+    def record_completion(self, cached_tokens: int, total_tokens: int, saved_ms: float) -> None:
+        """Thread-safely records cumulative metrics for Prometheus scraping."""
+        with self._metrics_lock:
+            self._cached_tokens_total += cached_tokens
+            self._prompt_tokens_total += total_tokens
+            self._saved_ms_total += saved_ms
+
+    def export_prometheus_metrics(self) -> str:
+        """Formats real-time cache and memory metrics into Prometheus text format (v0.0.4)."""
+        stats = self.get_stats()
+        with self._metrics_lock:
+            cached_toks = self._cached_tokens_total
+            prompt_toks = self._prompt_tokens_total
+            saved_sec = self._saved_ms_total / 1000.0
+
+        usage = stats["memory_usage_bytes"]
+        lines = [
+            "# HELP hypercache_queries_total Total LLM completion queries handled by HyperCache.",
+            "# TYPE hypercache_queries_total counter",
+            f"hypercache_queries_total {stats['total_queries']}",
+            "",
+            "# HELP hypercache_cached_tokens_total Total prompt tokens reused from cache fabric.",
+            "# TYPE hypercache_cached_tokens_total counter",
+            f"hypercache_cached_tokens_total {cached_toks}",
+            "",
+            "# HELP hypercache_prompt_tokens_total Total prompt tokens evaluated across all queries.",
+            "# TYPE hypercache_prompt_tokens_total counter",
+            f"hypercache_prompt_tokens_total {prompt_toks}",
+            "",
+            "# HELP hypercache_ttft_saved_seconds_total Cumulative estimated prefill latency saved.",
+            "# TYPE hypercache_ttft_saved_seconds_total counter",
+            f"hypercache_ttft_saved_seconds_total {saved_sec:.4f}",
+            "",
+            "# HELP hypercache_memory_usage_bytes Fabric memory usage across storage tiers in bytes.",
+            "# TYPE hypercache_memory_usage_bytes gauge",
+            f'hypercache_memory_usage_bytes{{tier="L1_LOCAL_VRAM"}} {usage.get("l1_vram", 0)}',
+            f'hypercache_memory_usage_bytes{{tier="L2_PINNED_RAM"}} {usage.get("l2_pinned_ram", 0)}',
+            f'hypercache_memory_usage_bytes{{tier="L3_NVME_SSD"}} {usage.get("l3_nvme_ssd", 0)}',
+            "",
+            "# HELP hypercache_hotspot_replications_total Total P2P broadcast tree replications triggered.",
+            "# TYPE hypercache_hotspot_replications_total counter",
+            f"hypercache_hotspot_replications_total {stats['hotspot_replications']}",
+            "",
+        ]
+        return "\n".join(lines)
 
     def get_stats(self) -> dict[str, Any]:
         """Returns cluster cache metrics and memory tier breakdown."""

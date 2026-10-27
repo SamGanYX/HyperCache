@@ -175,6 +175,11 @@ Intercepts `/v1/chat/completions` and `/v1/completions`, queries prefix blocks a
 python -m hypercache proxy --port 8000 --upstream http://127.0.0.1:8080
 ```
 
+Exposes standard endpoints for cluster observability:
+* `GET /metrics`: Prometheus 0.0.4 metrics exposition (`hypercache_queries_total`, `hypercache_cached_tokens_total`, `hypercache_memory_usage_bytes{tier="..."}`).
+* `GET /v1/hypercache/stats`: JSON cluster cache metrics and tier utilization.
+* `GET /v1/hypercache/health`: Kubernetes readiness/liveness probe.
+
 ## License
 
 MIT

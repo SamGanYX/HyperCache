@@ -370,6 +370,14 @@ def test_proxy_transparent_interception_and_telemetry_headers() -> None:
         with urllib.request.urlopen(req_stats, timeout=5.0) as resp_s:
             stats = json.loads(resp_s.read().decode())
             assert stats["total_queries"] >= 2
+
+        # Verify /metrics Prometheus text endpoint
+        req_metrics = urllib.request.Request(f"http://127.0.0.1:{proxy_port}/metrics")
+        with urllib.request.urlopen(req_metrics, timeout=5.0) as resp_m:
+            metrics_body = resp_m.read().decode("utf-8")
+            assert "hypercache_queries_total" in metrics_body
+            assert "hypercache_cached_tokens_total" in metrics_body
+            assert "hypercache_memory_usage_bytes" in metrics_body
     finally:
         proxy.stop()
         upstream.shutdown()
