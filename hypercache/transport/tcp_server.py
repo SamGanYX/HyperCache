@@ -9,6 +9,7 @@ KV-cache cluster over TCP sockets with wire-speed FP8/INT4 compression and CRC32
 from __future__ import annotations
 
 from dataclasses import dataclass
+import queue
 import socket
 import socketserver
 import struct
@@ -129,6 +130,7 @@ class HyperCacheTCPClient:
     """
     Client that quantizes `(K, V)` blocks into FP8/INT4 frames, streams them to a remote
     `HyperCacheTCPServer`, and fetches + dequantizes + RoPE-rotates them on demand.
+    Maintains a persistent connection pool to eliminate TCP handshake latency.
     """
 
     def __init__(
@@ -137,11 +139,43 @@ class HyperCacheTCPClient:
         port: int = 9470,
         quant_mode: KVQuantMode = KVQuantMode.FP8_E4M3,
         head_dim: int = 128,
+        max_pool_size: int = 8,
+        connect_timeout: float = 5.0,
     ) -> None:
         self.host = host
         self.port = port
         self.quant_mode = quant_mode
         self.rotator = RoPEPhaseRotator(head_dim=head_dim)
+        self.max_pool_size = max(1, max_pool_size)
+        self.connect_timeout = connect_timeout
+        self._pool: queue.LifoQueue[socket.socket] = queue.LifoQueue(maxsize=self.max_pool_size)
+        self._pool_lock = threading.Lock()
+
+    def _create_socket(self) -> socket.socket:
+        sock = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return sock
+
+    def _acquire_socket(self) -> socket.socket:
+        try:
+            return self._pool.get_nowait()
+        except queue.Empty:
+            return self._create_socket()
+
+    def _release_socket(self, sock: socket.socket, is_healthy: bool = True) -> None:
+        if not is_healthy:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return
+        try:
+            self._pool.put_nowait(sock)
+        except queue.Full:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
     def put_kv_block(
         self,
@@ -156,15 +190,31 @@ class HyperCacheTCPClient:
         )
         frame = PhysicalTieredStorageEngine.serialize_quantized_buffer(q_buf)
         key_bytes = block_hash.encode("utf-8")
+        hdr = struct.pack("<c H I", b"P", len(key_bytes), len(frame))
+        payload = hdr + key_bytes + frame
 
-        with socket.create_connection((self.host, self.port), timeout=5.0) as sock:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            hdr = struct.pack("<c H I", b"P", len(key_bytes), len(frame))
-            sock.sendall(hdr + key_bytes + frame)
+        sock = self._acquire_socket()
+        healthy = False
+        try:
+            sock.sendall(payload)
             resp = _recv_exact(sock, 5)
             status, _ = struct.unpack("<B I", resp)
             if status != 1:
                 raise RuntimeError("Remote HyperCacheTCPServer rejected PUT frame.")
+            healthy = True
+        except (ConnectionError, OSError):
+            healthy = False
+            # Transparent retry on fresh socket if a pooled connection had timed out
+            sock = self._create_socket()
+            sock.sendall(payload)
+            resp = _recv_exact(sock, 5)
+            status, _ = struct.unpack("<B I", resp)
+            if status != 1:
+                raise RuntimeError("Remote HyperCacheTCPServer rejected PUT frame.")
+            healthy = True
+        finally:
+            self._release_socket(sock, healthy)
+
         return len(frame)
 
     def get_kv_block(
@@ -178,27 +228,49 @@ class HyperCacheTCPClient:
         `new_start_pos`.
         """
         key_bytes = block_hash.encode("utf-8")
+        hdr = struct.pack("<c H I", b"G", len(key_bytes), 0)
+        req = hdr + key_bytes
         t0 = time.perf_counter()
 
-        with socket.create_connection((self.host, self.port), timeout=5.0) as sock:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            hdr = struct.pack("<c H I", b"G", len(key_bytes), 0)
-            sock.sendall(hdr + key_bytes)
+        sock = self._acquire_socket()
+        healthy = False
+        frame: Optional[bytes] = None
+        status = 0
+        try:
+            sock.sendall(req)
             resp = _recv_exact(sock, 5)
             status, payload_len = struct.unpack("<B I", resp)
-            if status != 1 or payload_len == 0:
-                elapsed_ms = (time.perf_counter() - t0) * 1000.0
-                return WireTransferResult(
-                    block_hash=block_hash,
-                    found=False,
-                    k_tensor=None,
-                    v_tensor=None,
-                    wire_bytes=0,
-                    raw_bf16_bytes=0,
-                    roundtrip_ms=elapsed_ms,
-                    effective_gbps=0.0,
-                )
-            frame = _recv_exact(sock, payload_len)
+            if status == 1 and payload_len > 0:
+                frame = _recv_exact(sock, payload_len)
+            healthy = True
+        except (ConnectionError, OSError):
+            healthy = False
+            # Transparent retry on fresh connection
+            try:
+                sock = self._create_socket()
+                sock.sendall(req)
+                resp = _recv_exact(sock, 5)
+                status, payload_len = struct.unpack("<B I", resp)
+                if status == 1 and payload_len > 0:
+                    frame = _recv_exact(sock, payload_len)
+                healthy = True
+            except Exception:
+                healthy = False
+        finally:
+            self._release_socket(sock, healthy)
+
+        if frame is None or status != 1:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            return WireTransferResult(
+                block_hash=block_hash,
+                found=False,
+                k_tensor=None,
+                v_tensor=None,
+                wire_bytes=0,
+                raw_bf16_bytes=0,
+                roundtrip_ms=elapsed_ms,
+                effective_gbps=0.0,
+            )
 
         q_buf = PhysicalTieredStorageEngine.deserialize_quantized_buffer(frame)
         k_f32, v_f32 = KVQuantizer.dequantize(q_buf)
@@ -219,3 +291,12 @@ class HyperCacheTCPClient:
             roundtrip_ms=elapsed_ms,
             effective_gbps=gbps,
         )
+
+    def close(self) -> None:
+        """Closes all idle pooled connections."""
+        while not self._pool.empty():
+            try:
+                sock = self._pool.get_nowait()
+                sock.close()
+            except Exception:
+                pass
