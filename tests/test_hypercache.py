@@ -41,6 +41,28 @@ def test_causal_chain_vs_modular_hash_and_tenant_isolation() -> None:
     assert blocks_a[0].modular_hash != blocks_beta[0].modular_hash
 
 
+def test_hasher_vectorized_packing_and_chunk_stream() -> None:
+    hasher = BlockHasher(block_size=8, cache_size=64)
+    tokens = list(range(1000, 1064))
+
+    # Test chunk_stream generator equivalence to chunk_and_hash
+    stream_blocks = list(hasher.chunk_stream(tokens, tenant_id="org-stream"))
+    list_blocks = hasher.chunk_and_hash(tokens, tenant_id="org-stream")
+    assert len(stream_blocks) == len(list_blocks) == 8
+    for sb, lb in zip(stream_blocks, list_blocks):
+        assert sb.causal_hash == lb.causal_hash
+        assert sb.modular_hash == lb.modular_hash
+
+    # Test LRU cache hit acceleration on repeat turn
+    c_hash1, m_hash1 = hasher.compute_block_hashes(tokens[:8], tenant_id="org-stream")
+    with hasher._cache_lock:
+        cache_len_before = len(hasher._hash_cache)
+    c_hash2, m_hash2 = hasher.compute_block_hashes(tokens[:8], tenant_id="org-stream")
+    assert c_hash1 == c_hash2 and m_hash1 == m_hash2
+    with hasher._cache_lock:
+        assert len(hasher._hash_cache) == cache_len_before
+
+
 def test_adversarial_middle_block_mutation_breaks_causal_chain() -> None:
     """
     Adversarial Critique Test:
@@ -357,6 +379,7 @@ def test_proxy_transparent_interception_and_telemetry_headers() -> None:
 if __name__ == "__main__":
     test_fns = [
         test_causal_chain_vs_modular_hash_and_tenant_isolation,
+        test_hasher_vectorized_packing_and_chunk_stream,
         test_adversarial_middle_block_mutation_breaks_causal_chain,
         test_relative_rope_phase_rotation_exactness,
         test_fp8_and_int4_kv_quantization_compression,

@@ -18,11 +18,14 @@ Therefore, HyperCache uses a Dual-Mode Deterministic Hashing architecture:
 
 from __future__ import annotations
 
+import array
+from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
 import hmac
 import struct
-from typing import Sequence
+import threading
+from typing import Iterator, Sequence
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,7 @@ class BlockHasher:
         model_id: str = "meta-llama/Llama-3-70B-Instruct",
         cluster_secret: str = "hypercache-default-cluster-secret",
         enable_tenant_isolation: bool = True,
+        cache_size: int = 16384,
     ) -> None:
         if block_size <= 0:
             raise ValueError("block_size must be a positive integer (e.g., 16 or 64).")
@@ -67,6 +71,9 @@ class BlockHasher:
         self.model_id = model_id
         self._cluster_secret = cluster_secret.encode("utf-8")
         self.enable_tenant_isolation = enable_tenant_isolation
+        self.cache_size = max(0, cache_size)
+        self._cache_lock = threading.Lock()
+        self._hash_cache: OrderedDict[tuple[str, str, bytes], tuple[str, str]] = OrderedDict()
 
     def _derive_tenant_key(self, tenant_id: str) -> bytes:
         """Derives a 32-byte HMAC key isolated per tenant (or global if public)."""
@@ -81,8 +88,16 @@ class BlockHasher:
 
     @staticmethod
     def _pack_tokens(token_ids: Sequence[int]) -> bytes:
-        """Packs integer token IDs into a compact little-endian uint32 byte buffer."""
-        return struct.pack(f"<{len(token_ids)}I", *token_ids)
+        """
+        Packs integer token IDs into a compact little-endian uint32 byte buffer.
+        Uses fast C-level array.array packing to avoid Python tuple unpacking overhead.
+        """
+        try:
+            arr = array.array("I", token_ids)
+            return arr.tobytes()
+        except (TypeError, OverflowError):
+            # Fallback for negative or non-standard token representations
+            return struct.pack(f"<{len(token_ids)}I", *token_ids)
 
     def compute_block_hashes(
         self,
@@ -92,9 +107,19 @@ class BlockHasher:
     ) -> tuple[str, str]:
         """
         Computes `(causal_hash, modular_hash)` as 32-character hex digests (128-bit BLAKE2b).
+        Results are cached in a thread-safe LRU cache to accelerate repeat agent prompt turns.
         """
-        t_key = self._derive_tenant_key(tenant_id)
         packed = self._pack_tokens(token_ids)
+        cache_key = (tenant_id, parent_causal_hash, packed)
+
+        if self.cache_size > 0:
+            with self._cache_lock:
+                cached = self._hash_cache.get(cache_key)
+                if cached is not None:
+                    self._hash_cache.move_to_end(cache_key)
+                    return cached
+
+        t_key = self._derive_tenant_key(tenant_id)
 
         # 1. Chained Causal Prefix Hash (depends on parent_causal_hash)
         causal_hasher = hashlib.blake2b(key=t_key, digest_size=16)
@@ -110,22 +135,26 @@ class BlockHasher:
         modular_hasher.update(packed)
         modular_hash = modular_hasher.hexdigest()
 
-        return causal_hash, modular_hash
+        result = (causal_hash, modular_hash)
 
-    def chunk_and_hash(
+        if self.cache_size > 0:
+            with self._cache_lock:
+                if len(self._hash_cache) >= self.cache_size:
+                    self._hash_cache.popitem(last=False)
+                self._hash_cache[cache_key] = result
+
+        return result
+
+    def chunk_stream(
         self,
         token_ids: Sequence[int],
         tenant_id: str = "public",
         drop_incomplete_tail: bool = False,
-    ) -> list[TokenBlock]:
+    ) -> Iterator[TokenBlock]:
         """
-        Splits a token sequence into deterministic blocks of `block_size` and computes
-        both chained causal hashes and position-independent Pre-RoPE modular hashes.
-
-        Note: The final partial block (if `len(token_ids) % block_size != 0`) is typically
-        computed as part of the active suffix during prefill unless `drop_incomplete_tail=False`.
+        Memory-bounded generator that yields `TokenBlock` instances one by one,
+        avoiding large intermediate list allocations on long-context prompts (64k-128k).
         """
-        blocks: list[TokenBlock] = []
         parent_hash = self.GENESIS_HASH
         total_len = len(token_ids)
 
@@ -139,18 +168,32 @@ class BlockHasher:
                 parent_causal_hash=parent_hash,
                 tenant_id=tenant_id,
             )
-            blocks.append(
-                TokenBlock(
-                    block_index=idx,
-                    start_token_offset=offset,
-                    token_ids=chunk,
-                    causal_hash=causal_h,
-                    modular_hash=modular_h,
-                    parent_causal_hash=parent_hash,
-                    tenant_id=tenant_id,
-                    model_id=self.model_id,
-                )
+            yield TokenBlock(
+                block_index=idx,
+                start_token_offset=offset,
+                token_ids=chunk,
+                causal_hash=causal_h,
+                modular_hash=modular_h,
+                parent_causal_hash=parent_hash,
+                tenant_id=tenant_id,
+                model_id=self.model_id,
             )
             parent_hash = causal_h
 
-        return blocks
+    def chunk_and_hash(
+        self,
+        token_ids: Sequence[int],
+        tenant_id: str = "public",
+        drop_incomplete_tail: bool = False,
+    ) -> list[TokenBlock]:
+        """
+        Splits a token sequence into deterministic blocks of `block_size` and computes
+        both chained causal hashes and position-independent Pre-RoPE modular hashes.
+        """
+        return list(
+            self.chunk_stream(
+                token_ids,
+                tenant_id=tenant_id,
+                drop_incomplete_tail=drop_incomplete_tail,
+            )
+        )
