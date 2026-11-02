@@ -189,6 +189,7 @@ def run_cluster_audit(
     gpu_profile: str = "h100",
     jsonl_path: Optional[Path] = None,
     daily_request_scale: int = 250_000,
+    num_simulated_requests: int = 120,
 ) -> AuditReport:
     """
     Executes the comparative simulation across Siloed APC, Legacy Host-TCP Offload,
@@ -197,7 +198,11 @@ def run_cluster_audit(
     requests = (
         load_jsonl_workload(jsonl_path, num_nodes=num_nodes)
         if jsonl_path is not None
-        else generate_workload(workload_type=workload_type, num_requests=120, num_nodes=num_nodes)
+        else generate_workload(
+            workload_type=workload_type,
+            num_requests=num_simulated_requests,
+            num_nodes=num_nodes,
+        )
     )
 
     hw = GPU_PROFILES.get(gpu_profile.lower(), GPU_PROFILES["h100"])

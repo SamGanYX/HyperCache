@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import mmap
 from pathlib import Path
 import struct
 import tempfile
@@ -211,24 +212,30 @@ class PhysicalTieredStorageEngine:
                     wire_or_disk_bytes=fp8_buf.compressed_bytes,
                 )
 
-            # 3. Check L3 (INT4 bit-packed binary file on disk)
+            # 3. Check L3 (INT4 bit-packed binary file on disk via zero-copy mmap)
             if block_hash in self._l3_index:
                 file_path = self._l3_index[block_hash]
                 if file_path.exists():
-                    raw_bytes = file_path.read_bytes()
-                    int4_buf = self.deserialize_quantized_buffer(raw_bytes)
-                    k_f32, v_f32 = KVQuantizer.dequantize(int4_buf)
-                    self.l3_hits += 1
-                    if promote_to_l1:
-                        self.put_block(block_hash, k_f32, v_f32, int4_buf.cached_start_pos)
-                    return PhysicalFetchResult(
-                        block_hash=block_hash,
-                        source_tier=MemoryTier.L3_NVME_SSD,
-                        k_tensor=k_f32,
-                        v_tensor=v_f32,
-                        cached_start_pos=int4_buf.cached_start_pos,
-                        wire_or_disk_bytes=len(raw_bytes),
-                    )
+                    file_size = file_path.stat().st_size
+                    int4_buf: Optional[QuantizedKVBuffer] = None
+                    if file_size > 0:
+                        with open(file_path, "rb") as f:
+                            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                                int4_buf = self.deserialize_quantized_buffer(mm)
+
+                    if int4_buf is not None:
+                        k_f32, v_f32 = KVQuantizer.dequantize(int4_buf)
+                        self.l3_hits += 1
+                        if promote_to_l1:
+                            self.put_block(block_hash, k_f32, v_f32, int4_buf.cached_start_pos)
+                        return PhysicalFetchResult(
+                            block_hash=block_hash,
+                            source_tier=MemoryTier.L3_NVME_SSD,
+                            k_tensor=k_f32,
+                            v_tensor=v_f32,
+                            cached_start_pos=int4_buf.cached_start_pos,
+                            wire_or_disk_bytes=file_size,
+                        )
 
             return None
 
@@ -277,13 +284,16 @@ class PhysicalTieredStorageEngine:
         return cls.MAGIC_HEADER + struct.pack("<I", crc) + body
 
     @classmethod
-    def deserialize_quantized_buffer(cls, data: bytes) -> QuantizedKVBuffer:
-        """Unpacks and verifies a CRC32-protected binary KV frame."""
-        if len(data) < 10 or data[:6] != cls.MAGIC_HEADER:
+    def deserialize_quantized_buffer(
+        cls, data: bytes | bytearray | memoryview | mmap.mmap
+    ) -> QuantizedKVBuffer:
+        """Unpacks and verifies a CRC32-protected binary KV frame using buffer protocol."""
+        mv = memoryview(data)
+        if len(mv) < 10 or bytes(mv[:6]) != cls.MAGIC_HEADER:
             raise ValueError("Invalid HyperCache binary KV frame magic header.")
 
-        (expected_crc,) = struct.unpack("<I", data[6:10])
-        body = data[10:]
+        (expected_crc,) = struct.unpack("<I", bytes(mv[6:10]))
+        body = mv[10:]
         actual_crc = zlib.crc32(body) & 0xFFFFFFFF
         if actual_crc != expected_crc:
             raise ValueError(
@@ -300,18 +310,18 @@ class PhysicalTieredStorageEngine:
             pv_len,
             sk_len,
             sv_len,
-        ) = struct.unpack("<B i B B I I I I", body[:hdr_size])
+        ) = struct.unpack("<B i B B I I I I", bytes(body[:hdr_size]))
         offset = hdr_size
 
-        mode_str = body[offset : offset + mode_len].decode("ascii")
+        mode_str = bytes(body[offset : offset + mode_len]).decode("ascii")
         offset += mode_len
         mode = KVQuantMode(mode_str)
 
-        orig_shape = struct.unpack(f"<{ndim}I", body[offset : offset + 4 * ndim])
+        orig_shape = struct.unpack(f"<{ndim}I", bytes(body[offset : offset + 4 * ndim]))
         offset += 4 * ndim
 
         scale_shape = struct.unpack(
-            f"<{scale_ndim}I", body[offset : offset + 4 * scale_ndim]
+            f"<{scale_ndim}I", bytes(body[offset : offset + 4 * scale_ndim])
         )
         offset += 4 * scale_ndim
 
