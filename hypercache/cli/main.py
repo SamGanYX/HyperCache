@@ -53,6 +53,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["h100", "a100", "b200"],
         help="GPU hardware profile (default: h100)",
     )
+    p_audit.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw audit metrics as JSON to stdout",
+    )
+    p_audit.add_argument(
+        "--export-json",
+        type=Path,
+        default=None,
+        help="Export audit metrics to a JSON file",
+    )
 
     # 2. `hypercache top`
     p_top = sub.add_parser(
@@ -88,6 +99,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="h100",
         choices=["h100", "a100", "b200"],
         help="GPU hardware profile (default: h100)",
+    )
+    p_bench.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw benchmark metrics as JSON to stdout",
+    )
+    p_bench.add_argument(
+        "--export-json",
+        type=Path,
+        default=None,
+        help="Export benchmark metrics to a JSON file",
     )
 
     # 4. `hypercache proxy`
@@ -136,7 +158,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             gpu_profile=gpu,
             jsonl_path=log_file,
         )
-        print(format_audit_report(report))
+        if getattr(args, "export_json", None) is not None:
+            p = Path(args.export_json)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(report.to_json(), encoding="utf-8")
+
+        if getattr(args, "json", False):
+            print(report.to_json())
+        else:
+            print(format_audit_report(report))
         return 0
 
     if cmd == "top":
@@ -148,7 +178,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if cmd == "benchmark":
-        run_break_even_benchmark(gpu_profile=args.gpu)
+        run_break_even_benchmark(
+            gpu_profile=args.gpu,
+            export_json_path=getattr(args, "export_json", None),
+            as_json=getattr(args, "json", False),
+        )
         return 0
 
     if cmd == "proxy":

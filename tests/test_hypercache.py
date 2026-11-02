@@ -473,6 +473,35 @@ def test_singleflight_request_coalescing_and_incast_prevention() -> None:
         server.stop()
 
 
+def test_cli_json_export_and_benchmark_machine_readable(tmp_path: Optional[Path] = None) -> None:
+    import json
+    import tempfile
+    from pathlib import Path
+    from benchmarks.break_even_benchmark import run_break_even_benchmark
+    from hypercache.cli.auditor import run_cluster_audit
+
+    with tempfile.TemporaryDirectory() as td:
+        export_file = Path(td) / "bench_metrics.json"
+        json_out = run_break_even_benchmark(
+            gpu_profile="h100", export_json_path=export_file, as_json=True
+        )
+        parsed = json.loads(json_out)
+        assert parsed["gpu_profile"] == "h100"
+        assert "verification" in parsed
+        assert len(parsed["break_even_model"]) == 4
+        assert export_file.is_file()
+
+        file_data = json.loads(export_file.read_text(encoding="utf-8"))
+        assert file_data["verification"]["hypercache_cosine_sim"] > 0.97
+
+    # Audit report to_dict / to_json serialization check
+    audit_rep = run_cluster_audit(workload_type="multi-agent-swe", num_nodes=2, daily_request_scale=1000)
+    audit_dict = audit_rep.to_dict()
+    assert audit_dict["workload_name"] == "multi-agent-swe"
+    assert audit_dict["hypercache_hit_rate"] > 0.90
+    assert "daily_usd_saved" in audit_dict
+
+
 if __name__ == "__main__":
     test_fns = [
         test_causal_chain_vs_modular_hash_and_tenant_isolation,
@@ -489,6 +518,7 @@ if __name__ == "__main__":
         test_proxy_transparent_interception_and_telemetry_headers,
         test_radix_trie_prefix_matching_and_branching,
         test_singleflight_request_coalescing_and_incast_prevention,
+        test_cli_json_export_and_benchmark_machine_readable,
     ]
     for fn in test_fns:
         fn()

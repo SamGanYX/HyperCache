@@ -55,6 +55,31 @@ class AuditReport:
     daily_usd_saved: float
     annual_usd_saved: float
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "workload_name": self.workload_name,
+            "num_nodes": self.num_nodes,
+            "gpu_name": self.gpu_name,
+            "total_requests": self.total_requests,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "siloed_apc_hit_rate": round(self.siloed_apc_hit_rate, 4),
+            "legacy_offload_hit_rate": round(self.legacy_offload_hit_rate, 4),
+            "hypercache_hit_rate": round(self.hypercache_hit_rate, 4),
+            "avg_recompute_ttft_ms": round(self.avg_recompute_ttft_ms, 2),
+            "avg_siloed_apc_ttft_ms": round(self.avg_siloed_apc_ttft_ms, 2),
+            "avg_legacy_tcp_ttft_ms": round(self.avg_legacy_tcp_ttft_ms, 2),
+            "avg_hypercache_ttft_ms": round(self.avg_hypercache_ttft_ms, 2),
+            "p95_siloed_apc_ttft_ms": round(self.p95_siloed_apc_ttft_ms, 2),
+            "p95_hypercache_ttft_ms": round(self.p95_hypercache_ttft_ms, 2),
+            "daily_tokens_saved": self.daily_tokens_saved,
+            "daily_gpu_hours_saved": round(self.daily_gpu_hours_saved, 2),
+            "daily_usd_saved": round(self.daily_usd_saved, 2),
+            "annual_usd_saved": round(self.annual_usd_saved, 2),
+        }
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent)
+
 
 def _make_deterministic_chunk(seed_id: int, num_tokens: int) -> list[int]:
     """Generates a deterministic sequence of token IDs representing a file or doc chunk."""

@@ -15,6 +15,9 @@ Clearly separates:
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import Any, Optional
 import numpy as np
 
 from hypercache.core.attention_engine import verify_reordered_rag_attention
@@ -26,7 +29,11 @@ from hypercache.transport.fabric import KernelBypassFabric, TransportBackend
 from hypercache.transport.tcp_server import HyperCacheTCPClient, HyperCacheTCPServer
 
 
-def run_break_even_benchmark(gpu_profile: str = "h100") -> str:
+def run_break_even_benchmark(
+    gpu_profile: str = "h100",
+    export_json_path: Optional[Path | str] = None,
+    as_json: bool = False,
+) -> str:
     # -------------------------------------------------------------------------
     # PART 1A: Real Multi-Layer Causal GQA Attention + RoPE + CacheBlend Proof
     # -------------------------------------------------------------------------
@@ -136,6 +143,8 @@ def run_break_even_benchmark(gpu_profile: str = "h100") -> str:
         "  " + "-" * 86,
     ]
 
+    break_even_rows: list[dict[str, Any]] = []
+
     for ctx_len in context_lengths:
         dag = GlobalRadixDAG(
             hasher=BlockHasher(block_size=64),
@@ -152,6 +161,17 @@ def run_break_even_benchmark(gpu_profile: str = "h100") -> str:
         bd = fabric.evaluate_plan_latency(plan)
         raw_gb = (ctx_len * fabric.hw.raw_kv_bytes_per_token) / (1024**3)
 
+        break_even_rows.append(
+            {
+                "context_tokens": ctx_len,
+                "raw_kv_gb": round(raw_gb, 2),
+                "full_recompute_ttft_ms": round(bd.full_recompute_ttft_ms, 1),
+                "legacy_host_tcp_ttft_ms": round(bd.legacy_host_tcp_ttft_ms, 1),
+                "hypercache_exposed_ttft_ms": round(bd.hypercache_exposed_ttft_ms, 1),
+                "speedup_vs_recompute": round(bd.speedup_vs_recompute, 1),
+            }
+        )
+
         lines.append(
             f"  {f'{ctx_len // 1024}k Tokens':<13} | "
             f"{f'{raw_gb:5.2f} GB':<11} | "
@@ -164,6 +184,40 @@ def run_break_even_benchmark(gpu_profile: str = "h100") -> str:
     lines.append(
         "==========================================================================================\n"
     )
+
+    benchmark_dict: dict[str, Any] = {
+        "gpu_profile": gpu_profile,
+        "hardware_name": fabric.hw.name,
+        "verification": {
+            "naive_stitch_cosine_sim": round(attn_res.naive_stitch_cosine_sim, 4),
+            "naive_stitch_rel_l2_error": round(attn_res.naive_stitch_rel_l2_error, 3),
+            "rope_only_cosine_sim": round(attn_res.rope_only_cosine_sim, 4),
+            "hypercache_cosine_sim": round(attn_res.hypercache_cosine_sim, 4),
+            "hypercache_rel_l2_error": round(attn_res.hypercache_rel_l2_error, 3),
+            "prefill_flops_saved_pct": round(attn_res.prefill_flops_saved_pct, 1),
+            "rope_shift_error": max_rope_err,
+            "fp8_compression_ratio": round(fp8_buf.compression_ratio, 2),
+            "fp8_cosine_sim": round(cos_sim_fp8, 6),
+            "int4_compression_ratio": round(int4_buf.compression_ratio, 2),
+            "int4_cosine_sim": round(cos_sim_int4, 6),
+            "int4_disk_bytes": l3_disk_bytes,
+            "tcp_roundtrip_ms": round(wire_res.roundtrip_ms, 2),
+            "tcp_wire_bytes": wire_res.wire_bytes,
+            "tcp_cosine_sim": round(tcp_cos_sim, 6),
+        },
+        "break_even_model": break_even_rows,
+    }
+
+    if export_json_path is not None:
+        p = Path(export_json_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(benchmark_dict, indent=2), encoding="utf-8")
+
+    if as_json:
+        json_output = json.dumps(benchmark_dict, indent=2)
+        print(json_output)
+        return json_output
+
     output = "\n".join(lines)
     print(output)
     return output
