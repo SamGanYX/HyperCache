@@ -21,6 +21,7 @@ import numpy as np
 
 from hypercache.core.quantizer import KVQuantizer, KVQuantMode, RoPEPhaseRotator
 from hypercache.core.storage_engine import PhysicalTieredStorageEngine
+from hypercache.transport.singleflight import SingleFlight
 
 
 @dataclass
@@ -141,6 +142,7 @@ class HyperCacheTCPClient:
         head_dim: int = 128,
         max_pool_size: int = 8,
         connect_timeout: float = 5.0,
+        enable_singleflight: bool = True,
     ) -> None:
         self.host = host
         self.port = port
@@ -148,8 +150,15 @@ class HyperCacheTCPClient:
         self.rotator = RoPEPhaseRotator(head_dim=head_dim)
         self.max_pool_size = max(1, max_pool_size)
         self.connect_timeout = connect_timeout
+        self.enable_singleflight = enable_singleflight
         self._pool: queue.LifoQueue[socket.socket] = queue.LifoQueue(maxsize=self.max_pool_size)
         self._pool_lock = threading.Lock()
+        self.singleflight: SingleFlight[tuple[Optional[bytes], int]] = SingleFlight()
+
+    @property
+    def deduplicated_fetches(self) -> int:
+        """Returns total in-flight fetch requests coalesced via SingleFlight."""
+        return self.singleflight.total_deduplicated
 
     def _create_socket(self) -> socket.socket:
         sock = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
@@ -226,38 +235,45 @@ class HyperCacheTCPClient:
         Fetches a compressed KV block over TCP, verifies its CRC32 checksum, dequantizes
         to float32, and optionally applies an on-the-fly relative RoPE phase shift to
         `new_start_pos`.
+        Uses SingleFlight request coalescing to suppress incast storms under concurrent load.
         """
-        key_bytes = block_hash.encode("utf-8")
-        hdr = struct.pack("<c H I", b"G", len(key_bytes), 0)
-        req = hdr + key_bytes
         t0 = time.perf_counter()
 
-        sock = self._acquire_socket()
-        healthy = False
-        frame: Optional[bytes] = None
-        status = 0
-        try:
-            sock.sendall(req)
-            resp = _recv_exact(sock, 5)
-            status, payload_len = struct.unpack("<B I", resp)
-            if status == 1 and payload_len > 0:
-                frame = _recv_exact(sock, payload_len)
-            healthy = True
-        except (ConnectionError, OSError):
+        def _fetch_wire_payload() -> tuple[Optional[bytes], int]:
+            key_bytes = block_hash.encode("utf-8")
+            hdr = struct.pack("<c H I", b"G", len(key_bytes), 0)
+            req = hdr + key_bytes
+            sock = self._acquire_socket()
             healthy = False
-            # Transparent retry on fresh connection
+            raw_frame: Optional[bytes] = None
+            code = 0
             try:
-                sock = self._create_socket()
                 sock.sendall(req)
                 resp = _recv_exact(sock, 5)
-                status, payload_len = struct.unpack("<B I", resp)
-                if status == 1 and payload_len > 0:
-                    frame = _recv_exact(sock, payload_len)
+                code, payload_len = struct.unpack("<B I", resp)
+                if code == 1 and payload_len > 0:
+                    raw_frame = _recv_exact(sock, payload_len)
                 healthy = True
-            except Exception:
+            except (ConnectionError, OSError):
                 healthy = False
-        finally:
-            self._release_socket(sock, healthy)
+                try:
+                    sock = self._create_socket()
+                    sock.sendall(req)
+                    resp = _recv_exact(sock, 5)
+                    code, payload_len = struct.unpack("<B I", resp)
+                    if code == 1 and payload_len > 0:
+                        raw_frame = _recv_exact(sock, payload_len)
+                    healthy = True
+                except Exception:
+                    healthy = False
+            finally:
+                self._release_socket(sock, healthy)
+            return raw_frame, code
+
+        if self.enable_singleflight:
+            (frame, status), _ = self.singleflight.do(block_hash, _fetch_wire_payload)
+        else:
+            frame, status = _fetch_wire_payload()
 
         if frame is None or status != 1:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0

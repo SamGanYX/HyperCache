@@ -5,6 +5,7 @@ Comprehensive Unit, Adversarial, Concurrency & End-to-End Test Suite for HyperCa
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import threading
 import numpy as np
 
 from hypercache.core.attention_engine import verify_reordered_rag_attention
@@ -423,6 +424,55 @@ def test_radix_trie_prefix_matching_and_branching() -> None:
     assert tokens_3 == 0
 
 
+def test_singleflight_request_coalescing_and_incast_prevention() -> None:
+    import time
+    from hypercache.transport.singleflight import SingleFlight
+
+    # 1. Pure SingleFlight concurrency unit test
+    sf: SingleFlight[str] = SingleFlight()
+    execution_counter = 0
+    lock = threading.Lock()
+
+    def slow_producer() -> str:
+        nonlocal execution_counter
+        with lock:
+            execution_counter += 1
+        time.sleep(0.04)
+        return "computed_token_payload"
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(sf.do, "shared_prefix_block", slow_producer) for _ in range(8)]
+        results = [f.result() for f in futures]
+
+    assert execution_counter == 1
+    assert sf.total_deduplicated == 7
+    assert all(res[0] == "computed_token_payload" for res in results)
+    leader_count = sum(1 for res in results if res[1] is True)
+    assert leader_count == 1
+
+    # 2. Integration test over live HyperCacheTCPServer
+    server = HyperCacheTCPServer("127.0.0.1", port=0)
+    server.start_background()
+    client = HyperCacheTCPClient("127.0.0.1", port=server.bound_port, max_pool_size=8)
+
+    try:
+        rng = np.random.default_rng(999)
+        k = rng.standard_normal((16, 8, 128), dtype=np.float32)
+        v = rng.standard_normal((16, 8, 128), dtype=np.float32)
+        client.put_kv_block("incast_hot_hash", k, v)
+
+        # 8 concurrent requests for the exact same block
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = [ex.submit(client.get_kv_block, "incast_hot_hash") for _ in range(8)]
+            responses = [f.result() for f in futures]
+
+        assert all(r.found for r in responses)
+        assert client.deduplicated_fetches >= 1
+    finally:
+        client.close()
+        server.stop()
+
+
 if __name__ == "__main__":
     test_fns = [
         test_causal_chain_vs_modular_hash_and_tenant_isolation,
@@ -438,6 +488,7 @@ if __name__ == "__main__":
         test_vllm_connector_reordered_rag_chunks_and_break_even_speedup,
         test_proxy_transparent_interception_and_telemetry_headers,
         test_radix_trie_prefix_matching_and_branching,
+        test_singleflight_request_coalescing_and_incast_prevention,
     ]
     for fn in test_fns:
         fn()
