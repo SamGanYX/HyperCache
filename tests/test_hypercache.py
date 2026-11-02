@@ -392,6 +392,37 @@ def test_proxy_transparent_interception_and_telemetry_headers() -> None:
         upstream.server_close()
 
 
+def test_radix_trie_prefix_matching_and_branching() -> None:
+    dag = GlobalRadixDAG(hasher=BlockHasher(block_size=4), enable_modular_rope_reuse=True)
+    seq_1 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]  # Blocks: A, B, C
+    plan_1 = dag.lookup_sequence(seq_1, requesting_node="node-alpha")
+    assert plan_1.recompute_tokens == 12
+
+    stats_1 = dag.trie_stats()
+    assert stats_1["total_nodes"] == 3
+    assert stats_1["max_depth"] == 3
+
+    # Sequence 2 shares first 2 blocks (A, B) and diverges on block 3 (D)
+    seq_2 = [1, 2, 3, 4, 5, 6, 7, 8, 99, 100, 101, 102]
+    matched_nodes, matched_tokens = dag.match_prefix_trie(seq_2)
+    assert len(matched_nodes) == 2
+    assert matched_tokens == 8
+
+    plan_2 = dag.lookup_sequence(seq_2, requesting_node="node-alpha")
+    assert plan_2.exact_causal_tokens == 8
+    assert plan_2.recompute_tokens == 4
+
+    stats_2 = dag.trie_stats()
+    assert stats_2["total_nodes"] == 4  # A, B, C, D
+    assert stats_2["max_depth"] == 3
+
+    # Sequence 3 completely diverges at root
+    seq_3 = [50, 51, 52, 53, 54, 55, 56, 57]
+    matched_3, tokens_3 = dag.match_prefix_trie(seq_3)
+    assert len(matched_3) == 0
+    assert tokens_3 == 0
+
+
 if __name__ == "__main__":
     test_fns = [
         test_causal_chain_vs_modular_hash_and_tenant_isolation,
@@ -406,6 +437,7 @@ if __name__ == "__main__":
         test_l1_to_l2_to_l3_demotion_and_cross_node_rdma_hit,
         test_vllm_connector_reordered_rag_chunks_and_break_even_speedup,
         test_proxy_transparent_interception_and_telemetry_headers,
+        test_radix_trie_prefix_matching_and_branching,
     ]
     for fn in test_fns:
         fn()

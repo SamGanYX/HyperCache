@@ -46,6 +46,103 @@ class BlockReplica:
 
 
 @dataclass
+class RadixTreeNode:
+    """A node in the global prefix radix tree representing a cached token block."""
+
+    causal_hash: str
+    num_tokens: int
+    parent: Optional[RadixTreeNode] = None
+    children: dict[str, RadixTreeNode] = field(default_factory=dict)
+    replicas: list[BlockReplica] = field(default_factory=list)
+    depth: int = 0
+    ref_count: int = 0
+
+    @property
+    def is_leaf(self) -> bool:
+        return len(self.children) == 0
+
+    def add_child(
+        self,
+        causal_hash: str,
+        num_tokens: int,
+        replica: Optional[BlockReplica] = None,
+    ) -> RadixTreeNode:
+        if causal_hash not in self.children:
+            child = RadixTreeNode(
+                causal_hash=causal_hash,
+                num_tokens=num_tokens,
+                parent=self,
+                depth=self.depth + 1,
+            )
+            self.children[causal_hash] = child
+        child = self.children[causal_hash]
+        if replica is not None and replica not in child.replicas:
+            child.replicas.append(replica)
+        return child
+
+
+class RadixTree:
+    """
+    Hierarchical prefix trie for O(K) prefix matching and branch exploration
+    in distributed KV-cache architectures (inspired by SGLang/RadixAttention).
+    """
+
+    def __init__(self) -> None:
+        self.root = RadixTreeNode(causal_hash="__ROOT__", num_tokens=0, depth=0)
+        self._total_nodes = 0
+
+    def insert_sequence(
+        self,
+        blocks: list[TokenBlock],
+        replicas: list[BlockReplica],
+    ) -> list[RadixTreeNode]:
+        """Inserts a sequential chain of blocks into the radix tree."""
+        current = self.root
+        nodes: list[RadixTreeNode] = []
+        for blk, rep in zip(blocks, replicas):
+            existed = blk.causal_hash in current.children
+            child = current.add_child(blk.causal_hash, blk.num_tokens, replica=rep)
+            if not existed:
+                self._total_nodes += 1
+            current = child
+            nodes.append(current)
+        return nodes
+
+    def match_longest_prefix(
+        self,
+        blocks: list[TokenBlock],
+    ) -> tuple[list[RadixTreeNode], int]:
+        """
+        Walks the tree matching blocks until a miss occurs.
+        Returns the list of matched nodes and total matched tokens.
+        """
+        matched_nodes: list[RadixTreeNode] = []
+        total_tokens = 0
+        current = self.root
+
+        for blk in blocks:
+            if blk.causal_hash in current.children:
+                current = current.children[blk.causal_hash]
+                matched_nodes.append(current)
+                total_tokens += current.num_tokens
+            else:
+                break
+
+        return matched_nodes, total_tokens
+
+    def get_node_count(self) -> int:
+        return self._total_nodes
+
+    def get_max_depth(self) -> int:
+        def _max_d(node: RadixTreeNode) -> int:
+            if not node.children:
+                return node.depth
+            return max(_max_d(ch) for ch in node.children.values())
+
+        return _max_d(self.root)
+
+
+@dataclass
 class BlockLookupHit:
     """Result of querying a single TokenBlock in the global Radix/Hash DAG."""
 
@@ -113,6 +210,8 @@ class GlobalRadixDAG:
         self._causal_index: dict[str, list[BlockReplica]] = {}
         # Secondary Index (Position-Independent): (tenant_id, modular_hash) -> list[BlockReplica]
         self._modular_index: dict[tuple[str, str], list[BlockReplica]] = {}
+        # Hierarchical Prefix Radix Trie for O(K) prefix matching
+        self.trie: RadixTree = RadixTree()
 
         # Per-node memory accounting: node_id -> {tier: used_bytes}
         self._node_usage: dict[str, dict[MemoryTier, int]] = {}
@@ -215,6 +314,7 @@ class GlobalRadixDAG:
         with self._lock:
             self._ensure_node(node_id)
             now = time.monotonic()
+            active_replicas: list[BlockReplica] = []
 
             for blk in blocks:
                 raw_bytes = blk.num_tokens * self.raw_kv_bytes_per_token
@@ -222,6 +322,7 @@ class GlobalRadixDAG:
                 if existing_rep is not None:
                     existing_rep.last_accessed = now
                     existing_rep.access_count += 1
+                    active_replicas.append(existing_rep)
                     continue
 
                 self._evict_or_demote_if_needed(node_id, raw_bytes)
@@ -244,6 +345,9 @@ class GlobalRadixDAG:
                 )
                 mod_key = (effective_tenant, blk.modular_hash)
                 self._modular_index.setdefault(mod_key, []).append(replica)
+                active_replicas.append(replica)
+
+            self.trie.insert_sequence(blocks, active_replicas)
 
     def _select_best_replica(
         self,
@@ -329,10 +433,15 @@ class GlobalRadixDAG:
         with self._lock:
             self.total_queries += 1
             self._ensure_node(requesting_node)
+            matched_nodes, _ = self.trie.match_longest_prefix(blocks)
 
-            for blk in blocks:
-                # 1. Try Exact Causal Prefix Match
-                causal_reps = self._causal_index.get(blk.causal_hash)
+            for i, blk in enumerate(blocks):
+                # 1. Try Exact Causal Prefix Match via Radix Tree
+                causal_reps = (
+                    matched_nodes[i].replicas
+                    if i < len(matched_nodes) and matched_nodes[i].replicas
+                    else (self._causal_index.get(blk.causal_hash) if causal_chain_intact else None)
+                )
                 if causal_chain_intact and causal_reps:
                     rep, eff_tier = self._select_best_replica(causal_reps, requesting_node)
                     wire_bytes = (
@@ -416,3 +525,24 @@ class GlobalRadixDAG:
             tier_breakdown=tier_counts,
             lookup_latency_us=elapsed_us,
         )
+
+    def match_prefix_trie(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        tenant_id: str = "public",
+    ) -> tuple[list[RadixTreeNode], int]:
+        """
+        Fast trie-based longest prefix match returning the matched radix nodes
+        and the number of prefix tokens matched in O(num_blocks) steps.
+        """
+        blocks = self.hasher.chunk_and_hash(token_ids, tenant_id=tenant_id)
+        with self._lock:
+            return self.trie.match_longest_prefix(blocks)
+
+    def trie_stats(self) -> dict[str, int]:
+        """Returns structural metrics of the global prefix radix trie."""
+        with self._lock:
+            return {
+                "total_nodes": self.trie.get_node_count(),
+                "max_depth": self.trie.get_max_depth(),
+            }
