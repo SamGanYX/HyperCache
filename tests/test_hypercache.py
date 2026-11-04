@@ -5,7 +5,14 @@ Comprehensive Unit, Adversarial, Concurrency & End-to-End Test Suite for HyperCa
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import sys
 import threading
+
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import numpy as np
 
 from hypercache.core.attention_engine import verify_reordered_rag_attention
@@ -473,10 +480,9 @@ def test_singleflight_request_coalescing_and_incast_prevention() -> None:
         server.stop()
 
 
-def test_cli_json_export_and_benchmark_machine_readable(tmp_path: Optional[Path] = None) -> None:
+def test_cli_json_export_and_benchmark_machine_readable() -> None:
     import json
     import tempfile
-    from pathlib import Path
     from benchmarks.break_even_benchmark import run_break_even_benchmark
     from hypercache.cli.auditor import run_cluster_audit
 

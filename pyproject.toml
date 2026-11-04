@@ -27,4 +27,4 @@ hypercache = "hypercache.cli.main:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["hypercache*"]
+include = ["hypercache*", "benchmarks*"]

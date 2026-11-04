@@ -318,78 +318,92 @@ class PhysicalTieredStorageEngine:
     ) -> QuantizedKVBuffer:
         """Unpacks and verifies a CRC32-protected binary KV frame using buffer protocol."""
         mv = memoryview(data)
-        if len(mv) < 10 or bytes(mv[:6]) != cls.MAGIC_HEADER:
-            raise ValueError("Invalid HyperCache binary KV frame magic header.")
+        body: Optional[memoryview] = None
+        try:
+            if len(mv) < 10 or bytes(mv[:6]) != cls.MAGIC_HEADER:
+                raise ValueError("Invalid HyperCache binary KV frame magic header.")
 
-        (expected_crc,) = struct.unpack("<I", bytes(mv[6:10]))
-        body = mv[10:]
-        actual_crc = zlib.crc32(body) & 0xFFFFFFFF
-        if actual_crc != expected_crc:
-            raise ValueError(
-                f"CRC32 checksum mismatch in KV block frame: expected {expected_crc:#x}, got {actual_crc:#x}"
+            (expected_crc,) = struct.unpack("<I", bytes(mv[6:10]))
+            body = mv[10:]
+            actual_crc = zlib.crc32(body) & 0xFFFFFFFF
+            if actual_crc != expected_crc:
+                raise ValueError(
+                    f"CRC32 checksum mismatch in KV block frame: expected {expected_crc:#x}, got {actual_crc:#x}"
+                )
+
+            hdr_size = struct.calcsize("<B i B B I I I I")
+            (
+                mode_len,
+                cached_start_pos,
+                ndim,
+                scale_ndim,
+                pk_len,
+                pv_len,
+                sk_len,
+                sv_len,
+            ) = struct.unpack("<B i B B I I I I", bytes(body[:hdr_size]))
+            offset = hdr_size
+
+            mode_str = bytes(body[offset : offset + mode_len]).decode("ascii")
+            offset += mode_len
+            mode = KVQuantMode(mode_str)
+
+            orig_shape = struct.unpack(f"<{ndim}I", bytes(body[offset : offset + 4 * ndim]))
+            offset += 4 * ndim
+
+            scale_shape = struct.unpack(
+                f"<{scale_ndim}I", bytes(body[offset : offset + 4 * scale_ndim])
+            )
+            offset += 4 * scale_ndim
+
+            if mode == KVQuantMode.NONE:
+                packed_dtype = np.float16
+                packed_shape = orig_shape
+            elif mode == KVQuantMode.FP8_E4M3:
+                packed_dtype = np.int8
+                packed_shape = orig_shape
+            else:
+                packed_dtype = np.uint8
+                packed_shape = (*orig_shape[:-1], orig_shape[-1] // 2)
+
+            pk_copy = (
+                np.frombuffer(body[offset : offset + pk_len], dtype=packed_dtype)
+                .reshape(packed_shape)
+                .copy()
+            )
+            offset += pk_len
+            pv_copy = (
+                np.frombuffer(body[offset : offset + pv_len], dtype=packed_dtype)
+                .reshape(packed_shape)
+                .copy()
+            )
+            offset += pv_len
+
+            sk_copy = (
+                np.frombuffer(body[offset : offset + sk_len], dtype=np.float16)
+                .reshape(scale_shape)
+                .copy()
+            )
+            offset += sk_len
+            sv_copy = (
+                np.frombuffer(body[offset : offset + sv_len], dtype=np.float16)
+                .reshape(scale_shape)
+                .copy()
             )
 
-        hdr_size = struct.calcsize("<B i B B I I I I")
-        (
-            mode_len,
-            cached_start_pos,
-            ndim,
-            scale_ndim,
-            pk_len,
-            pv_len,
-            sk_len,
-            sv_len,
-        ) = struct.unpack("<B i B B I I I I", bytes(body[:hdr_size]))
-        offset = hdr_size
-
-        mode_str = bytes(body[offset : offset + mode_len]).decode("ascii")
-        offset += mode_len
-        mode = KVQuantMode(mode_str)
-
-        orig_shape = struct.unpack(f"<{ndim}I", bytes(body[offset : offset + 4 * ndim]))
-        offset += 4 * ndim
-
-        scale_shape = struct.unpack(
-            f"<{scale_ndim}I", bytes(body[offset : offset + 4 * scale_ndim])
-        )
-        offset += 4 * scale_ndim
-
-        if mode == KVQuantMode.NONE:
-            packed_dtype = np.float16
-            packed_shape = orig_shape
-        elif mode == KVQuantMode.FP8_E4M3:
-            packed_dtype = np.int8
-            packed_shape = orig_shape
-        else:
-            packed_dtype = np.uint8
-            packed_shape = (*orig_shape[:-1], orig_shape[-1] // 2)
-
-        pk = np.frombuffer(body[offset : offset + pk_len], dtype=packed_dtype).reshape(
-            packed_shape
-        )
-        offset += pk_len
-        pv = np.frombuffer(body[offset : offset + pv_len], dtype=packed_dtype).reshape(
-            packed_shape
-        )
-        offset += pv_len
-
-        sk = np.frombuffer(body[offset : offset + sk_len], dtype=np.float16).reshape(
-            scale_shape
-        )
-        offset += sk_len
-        sv = np.frombuffer(body[offset : offset + sv_len], dtype=np.float16).reshape(
-            scale_shape
-        )
-
-        return QuantizedKVBuffer(
-            mode=mode,
-            packed_k=pk.copy(),
-            packed_v=pv.copy(),
-            scale_k=sk.copy(),
-            scale_v=sv.copy(),
-            original_shape=orig_shape,
-            cached_start_pos=cached_start_pos,
-        )
+            return QuantizedKVBuffer(
+                mode=mode,
+                packed_k=pk_copy,
+                packed_v=pv_copy,
+                scale_k=sk_copy,
+                scale_v=sv_copy,
+                original_shape=orig_shape,
+                cached_start_pos=cached_start_pos,
+            )
+        finally:
+            if body is not None:
+                body.release()
+            mv.release()
 
     def close(self) -> None:
         self._stop_event.set()
