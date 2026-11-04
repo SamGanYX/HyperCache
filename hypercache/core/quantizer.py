@@ -78,20 +78,23 @@ class QuantizedKVBuffer:
     def slice_tokens(self, start_token: int, num_tokens: int) -> QuantizedKVBuffer:
         """
         Slices a subset of tokens [start_token .. start_token + num_tokens] from the buffer
-        without full dequantization, enabling sub-block cache reuse.
+        without full dequantization, enabling sub-block cache reuse across both per-head
+        and sub-channel group-scaled buffers.
         """
         if start_token < 0 or num_tokens <= 0:
             raise ValueError("Invalid slice parameters.")
         end_token = start_token + num_tokens
+        token_axis = len(self.original_shape) - 3
         new_shape = list(self.original_shape)
-        new_shape[-3] = num_tokens
+        new_shape[token_axis] = num_tokens
 
-        sliced_k = np.ascontiguousarray(self.packed_k[..., start_token:end_token, :, :])
-        sliced_v = np.ascontiguousarray(self.packed_v[..., start_token:end_token, :, :])
+        slc = (slice(None),) * token_axis + (slice(start_token, end_token),)
+        sliced_k = np.ascontiguousarray(self.packed_k[slc])
+        sliced_v = np.ascontiguousarray(self.packed_v[slc])
 
-        if self.scale_k.ndim >= 3 and self.scale_k.shape[-3] > 1:
-            sliced_sk = np.ascontiguousarray(self.scale_k[..., start_token:end_token, :, :])
-            sliced_sv = np.ascontiguousarray(self.scale_v[..., start_token:end_token, :, :])
+        if self.scale_k.ndim >= 3 and self.scale_k.shape[token_axis] > 1:
+            sliced_sk = np.ascontiguousarray(self.scale_k[slc])
+            sliced_sv = np.ascontiguousarray(self.scale_v[slc])
         else:
             sliced_sk = self.scale_k.copy()
             sliced_sv = self.scale_v.copy()
@@ -133,9 +136,12 @@ class KVQuantizer:
         v_tensor: np.ndarray,
         mode: KVQuantMode = KVQuantMode.FP8_E4M3,
         cached_start_pos: int = 0,
+        group_size: int = 64,
     ) -> QuantizedKVBuffer:
         """
         Quantizes K and V tensors of shape `(..., num_tokens, num_kv_heads, head_dim)`.
+        In `INT4_GROUP` mode, supports sub-channel group scaling (`group_size=64` or `32`)
+        along `head_dim` to isolate outlier channels and maximize cosine similarity.
         """
         if k_tensor.shape != v_tensor.shape:
             raise ValueError(f"K and V shape mismatch: {k_tensor.shape} vs {v_tensor.shape}")
@@ -177,16 +183,39 @@ class KVQuantizer:
 
         if mode == KVQuantMode.INT4_GROUP:
             # Symmetric INT4 [-7, 7] packed 2 values per uint8 byte along head_dim
-            if orig_shape[-1] % 2 != 0:
+            head_dim = orig_shape[-1]
+            if head_dim % 2 != 0:
                 raise ValueError("head_dim must be even for INT4 byte packing.")
 
-            max_k = np.maximum(np.max(np.abs(k_f32), axis=-1, keepdims=True), 1e-6)
-            max_v = np.maximum(np.max(np.abs(v_f32), axis=-1, keepdims=True), 1e-6)
-            scale_k = (max_k / 7.0).astype(np.float16)
-            scale_v = (max_v / 7.0).astype(np.float16)
+            eff_group = (
+                group_size
+                if (0 < group_size < head_dim and head_dim % group_size == 0)
+                else head_dim
+            )
+            if eff_group < head_dim:
+                num_groups = head_dim // eff_group
+                grouped_shape = (*orig_shape[:-1], num_groups, eff_group)
+                k_grp = k_f32.reshape(grouped_shape)
+                v_grp = v_f32.reshape(grouped_shape)
+                max_k = np.maximum(np.max(np.abs(k_grp), axis=-1, keepdims=True), 1e-6)
+                max_v = np.maximum(np.max(np.abs(v_grp), axis=-1, keepdims=True), 1e-6)
+                scale_k = (max_k / 7.0).astype(np.float16)
+                scale_v = (max_v / 7.0).astype(np.float16)
 
-            q_k = np.clip(np.round(k_f32 / scale_k), -7, 7).astype(np.int8) + 8
-            q_v = np.clip(np.round(v_f32 / scale_v), -7, 7).astype(np.int8) + 8
+                q_k = (
+                    np.clip(np.round(k_grp / scale_k), -7, 7).astype(np.int8) + 8
+                ).reshape(orig_shape)
+                q_v = (
+                    np.clip(np.round(v_grp / scale_v), -7, 7).astype(np.int8) + 8
+                ).reshape(orig_shape)
+            else:
+                max_k = np.maximum(np.max(np.abs(k_f32), axis=-1, keepdims=True), 1e-6)
+                max_v = np.maximum(np.max(np.abs(v_f32), axis=-1, keepdims=True), 1e-6)
+                scale_k = (max_k / 7.0).astype(np.float16)
+                scale_v = (max_v / 7.0).astype(np.float16)
+
+                q_k = np.clip(np.round(k_f32 / scale_k), -7, 7).astype(np.int8) + 8
+                q_v = np.clip(np.round(v_f32 / scale_v), -7, 7).astype(np.int8) + 8
 
             packed_k = ((q_k[..., 0::2].astype(np.uint8) << 4) | (q_k[..., 1::2].astype(np.uint8) & 0x0F))
             packed_v = ((q_v[..., 0::2].astype(np.uint8) << 4) | (q_v[..., 1::2].astype(np.uint8) & 0x0F))
@@ -226,6 +255,18 @@ class KVQuantizer:
             k_unpacked[..., 1::2] = k_lo
             v_unpacked[..., 0::2] = v_hi
             v_unpacked[..., 1::2] = v_lo
+
+            if buf.scale_k.ndim == len(buf.original_shape) + 1:
+                num_groups = buf.scale_k.shape[-2]
+                eff_group = buf.original_shape[-1] // num_groups
+                grouped_shape = (*buf.original_shape[:-1], num_groups, eff_group)
+                k_out = (
+                    k_unpacked.reshape(grouped_shape) * buf.scale_k.astype(np.float32)
+                ).reshape(buf.original_shape)
+                v_out = (
+                    v_unpacked.reshape(grouped_shape) * buf.scale_v.astype(np.float32)
+                ).reshape(buf.original_shape)
+                return k_out, v_out
 
             return (
                 k_unpacked * buf.scale_k.astype(np.float32),

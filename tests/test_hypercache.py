@@ -617,6 +617,34 @@ def test_physical_storage_tier_promotion_dedup_and_l3_disk_lru() -> None:
         engine.close()
 
 
+def test_int4_subchannel_group_quantization_outlier_resilience() -> None:
+    rng = np.random.default_rng(1337)
+    k = rng.standard_normal((1, 16, 4, 128), dtype=np.float32)
+    v = rng.standard_normal((1, 16, 4, 128), dtype=np.float32)
+
+    # Inject a realistic Transformer Key outlier channel in channel 0 (25x magnitude)
+    k[..., 0] *= 25.0
+
+    buf_per_head = KVQuantizer.quantize(k, v, mode=KVQuantMode.INT4_GROUP, group_size=128)
+    buf_sub_grp = KVQuantizer.quantize(k, v, mode=KVQuantMode.INT4_GROUP, group_size=32)
+
+    k_ph, _ = KVQuantizer.dequantize(buf_per_head)
+    k_sg, _ = KVQuantizer.dequantize(buf_sub_grp)
+
+    # Evaluate reconstruction fidelity on the non-outlier channels [32:]
+    cos_per_head_non_outlier = KVQuantizer.cosine_similarity(k[..., 32:], k_ph[..., 32:])
+    cos_sub_grp_non_outlier = KVQuantizer.cosine_similarity(k[..., 32:], k_sg[..., 32:])
+    assert cos_sub_grp_non_outlier > cos_per_head_non_outlier
+    assert cos_sub_grp_non_outlier > 0.992
+
+    # Verify sub-block token slicing works seamlessly on multi-group INT4 buffers
+    sliced_sg = buf_sub_grp.slice_tokens(start_token=4, num_tokens=8)
+    k_sliced, _ = KVQuantizer.dequantize(sliced_sg)
+    assert k_sliced.shape == (1, 8, 4, 128)
+    assert np.allclose(k_sg[:, 4:12], k_sliced)
+    assert KVQuantizer.cosine_similarity(k[:, 4:12], k_sliced) > 0.985
+
+
 if __name__ == "__main__":
     test_fns = [
         test_causal_chain_vs_modular_hash_and_tenant_isolation,
@@ -637,6 +665,7 @@ if __name__ == "__main__":
         test_proxy_deterministic_tokenization_and_tool_schema_prefix_caching,
         test_radix_dag_zero_tier_capacity_and_l3_eviction_purge,
         test_physical_storage_tier_promotion_dedup_and_l3_disk_lru,
+        test_int4_subchannel_group_quantization_outlier_resilience,
     ]
     for fn in test_fns:
         fn()
