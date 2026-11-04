@@ -26,6 +26,7 @@ import hmac
 import struct
 import threading
 from typing import Iterator, Sequence
+import zlib
 
 
 @dataclass(frozen=True)
@@ -74,17 +75,36 @@ class BlockHasher:
         self.cache_size = max(0, cache_size)
         self._cache_lock = threading.Lock()
         self._hash_cache: OrderedDict[tuple[str, str, bytes], tuple[str, str]] = OrderedDict()
+        self._tenant_key_cache: dict[str, bytes] = {}
 
     def _derive_tenant_key(self, tenant_id: str) -> bytes:
-        """Derives a 32-byte HMAC key isolated per tenant (or global if public)."""
+        """Derives and caches a 32-byte HMAC key isolated per tenant (or global if public)."""
         effective_tenant = (
             tenant_id if (self.enable_tenant_isolation and tenant_id != "public") else "public"
         )
-        return hmac.new(
+        cached_key = self._tenant_key_cache.get(effective_tenant)
+        if cached_key is not None:
+            return cached_key
+
+        derived = hmac.new(
             self._cluster_secret,
             f"tenant:{effective_tenant}|model:{self.model_id}".encode("utf-8"),
             hashlib.sha256,
         ).digest()
+        self._tenant_key_cache[effective_tenant] = derived
+        return derived
+
+    @staticmethod
+    def deterministic_tokenize(text: str) -> list[int]:
+        """
+        Deterministic, cross-process invariant word/subword tokenizer fallback.
+        Unlike Python's built-in `hash()`, which is randomized per process via
+        `PYTHONHASHSEED`, CRC32 produces identical uint32 token IDs across all
+        nodes, processes, and restarts.
+        """
+        if not text:
+            return []
+        return [(zlib.crc32(w.encode("utf-8")) & 0xFFFFFFFF) % 100_000 for w in text.split()]
 
     @staticmethod
     def _pack_tokens(token_ids: Sequence[int]) -> bytes:

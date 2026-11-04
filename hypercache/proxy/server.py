@@ -82,10 +82,21 @@ class HyperCacheProxyHandler(BaseHTTPRequestHandler):
         self._proxy_generic_request("POST")
 
     def _extract_prompt_text(self, body: dict[str, Any]) -> str:
-        """Extracts linear prompt text from standard OpenAI chat or completion bodies."""
+        """Extracts linear prompt text from standard OpenAI chat, tool-use, or completion bodies."""
+        prefix_segments: list[str] = []
+
+        # Canonicalize OpenAI tool / function schemas if present (major prefix in agent swarms)
+        if "tools" in body and isinstance(body["tools"], list) and body["tools"]:
+            tools_canon = json.dumps(body["tools"], sort_keys=True, separators=(",", " : "))
+            prefix_segments.append(f"<|im_start|>tools\n{tools_canon}<|im_end|>")
+        elif "functions" in body and isinstance(body["functions"], list) and body["functions"]:
+            fns_canon = json.dumps(body["functions"], sort_keys=True, separators=(",", " : "))
+            prefix_segments.append(f"<|im_start|>functions\n{fns_canon}<|im_end|>")
+
         if "messages" in body and isinstance(body["messages"], list):
-            parts = []
             for msg in body["messages"]:
+                if not isinstance(msg, dict):
+                    continue
                 role = msg.get("role", "")
                 content = msg.get("content", "")
                 if isinstance(content, list):
@@ -96,25 +107,33 @@ class HyperCacheProxyHandler(BaseHTTPRequestHandler):
                         if isinstance(item, dict) and item.get("type") == "text"
                     ]
                     content = " ".join(text_parts)
-                parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
-            return "\n".join(parts)
+                elif content is None:
+                    content = ""
+
+                tool_calls_str = ""
+                if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
+                    tool_calls_str = " " + json.dumps(
+                        msg["tool_calls"], sort_keys=True, separators=(",", " : ")
+                    )
+                prefix_segments.append(f"<|im_start|>{role}\n{content}{tool_calls_str}<|im_end|>")
+            return "\n".join(prefix_segments)
 
         if "prompt" in body:
             prompt = body["prompt"]
             if isinstance(prompt, str):
-                return prompt
-            if isinstance(prompt, list):
-                return " ".join(str(p) for p in prompt)
+                prefix_segments.append(prompt)
+            elif isinstance(prompt, list):
+                prefix_segments.append(" ".join(str(p) for p in prompt))
+            return "\n".join(prefix_segments)
 
-        return ""
+        return "\n".join(prefix_segments)
 
     def _tokenize_fallback(self, text: str) -> list[int]:
         """
-        Deterministic word-level tokenization fallback for proxy parsing when
-        an engine-specific tokenizer is not loaded.
+        Deterministic, cross-process invariant word-level tokenization fallback for
+        proxy parsing when an engine-specific tokenizer is not loaded.
         """
-        words = text.split()
-        return [abs(hash(w)) % 100_000 for w in words]
+        return BlockHasher.deterministic_tokenize(text)
 
     def _handle_completion_request(self) -> None:
         content_length = int(self.headers.get("Content-Length", 0))

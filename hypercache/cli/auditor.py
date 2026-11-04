@@ -169,8 +169,8 @@ def load_jsonl_workload(path: Path, num_nodes: int = 4) -> list[SimulatedRequest
                 tokens = [int(x) for x in row["token_ids"]]
             else:
                 text = str(row.get("prompt", ""))
-                # Deterministic word-level tokenization fallback
-                tokens = [abs(hash(w)) % 100_000 for w in text.split()]
+                # Deterministic cross-process word-level tokenization fallback
+                tokens = BlockHasher.deterministic_tokenize(text)
             requests.append(
                 SimulatedRequest(
                     request_id=str(row.get("request_id", f"req-{idx + 1:04d}")),

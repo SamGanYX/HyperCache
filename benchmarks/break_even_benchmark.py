@@ -33,6 +33,7 @@ def run_break_even_benchmark(
     gpu_profile: str = "h100",
     export_json_path: Optional[Path | str] = None,
     as_json: bool = False,
+    context_lengths: Optional[list[int]] = None,
 ) -> str:
     # -------------------------------------------------------------------------
     # PART 1A: Real Multi-Layer Causal GQA Attention + RoPE + CacheBlend Proof
@@ -114,7 +115,7 @@ def run_break_even_benchmark(
         layer_overlap=True,
     )
 
-    context_lengths = [16_384, 32_768, 65_536, 131_072]
+    context_lengths = context_lengths or [16_384, 32_768, 65_536, 131_072]
     lines = [
         "",
         "==========================================================================================",

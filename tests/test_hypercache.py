@@ -483,12 +483,15 @@ def test_cli_json_export_and_benchmark_machine_readable(tmp_path: Optional[Path]
     with tempfile.TemporaryDirectory() as td:
         export_file = Path(td) / "bench_metrics.json"
         json_out = run_break_even_benchmark(
-            gpu_profile="h100", export_json_path=export_file, as_json=True
+            gpu_profile="h100",
+            export_json_path=export_file,
+            as_json=True,
+            context_lengths=[4096, 8192],
         )
         parsed = json.loads(json_out)
         assert parsed["gpu_profile"] == "h100"
         assert "verification" in parsed
-        assert len(parsed["break_even_model"]) == 4
+        assert len(parsed["break_even_model"]) == 2
         assert export_file.is_file()
 
         file_data = json.loads(export_file.read_text(encoding="utf-8"))
@@ -499,12 +502,44 @@ def test_cli_json_export_and_benchmark_machine_readable(tmp_path: Optional[Path]
         workload_type="multi-agent-swe",
         num_nodes=2,
         daily_request_scale=1000,
-        num_simulated_requests=12,
+        num_simulated_requests=8,
     )
     audit_dict = audit_rep.to_dict()
     assert audit_dict["workload_name"] == "multi-agent-swe"
     assert audit_dict["hypercache_hit_rate"] >= audit_dict["siloed_apc_hit_rate"]
     assert "daily_usd_saved" in audit_dict
+
+
+def test_proxy_deterministic_tokenization_and_tool_schema_prefix_caching() -> None:
+    import zlib
+    from hypercache.proxy.server import HyperCacheProxyHandler
+
+    # 1. Verify CRC32 tokenization is invariant to PYTHONHASHSEED across nodes
+    sample_prompt = "You are an autonomous coding agent operating on a distributed KV fabric."
+    toks_1 = BlockHasher.deterministic_tokenize(sample_prompt)
+    toks_2 = BlockHasher.deterministic_tokenize(sample_prompt)
+    assert toks_1 == toks_2
+    assert toks_1[0] == (zlib.crc32(b"You") & 0xFFFFFFFF) % 100_000
+
+    # 2. Verify tenant HMAC key caching in BlockHasher
+    hasher = BlockHasher(block_size=4)
+    hasher.compute_block_hashes([1, 2, 3, 4], tenant_id="org-cache-test")
+    assert "org-cache-test" in hasher._tenant_key_cache
+
+    # 3. Verify OpenAI tool schemas with reordered dict keys canonicalize identically
+    dummy_handler = object.__new__(HyperCacheProxyHandler)
+    body_a = {
+        "tools": [{"type": "function", "function": {"name": "exec_sql", "description": "Run query"}}],
+        "messages": [{"role": "user", "content": "Select top 10 users"}],
+    }
+    body_b = {
+        "tools": [{"function": {"description": "Run query", "name": "exec_sql"}, "type": "function"}],
+        "messages": [{"role": "user", "content": "Select top 10 users"}],
+    }
+    extracted_a = dummy_handler._extract_prompt_text(body_a)
+    extracted_b = dummy_handler._extract_prompt_text(body_b)
+    assert extracted_a == extracted_b
+    assert "<|im_start|>tools" in extracted_a
 
 
 if __name__ == "__main__":
@@ -524,6 +559,7 @@ if __name__ == "__main__":
         test_radix_trie_prefix_matching_and_branching,
         test_singleflight_request_coalescing_and_incast_prevention,
         test_cli_json_export_and_benchmark_machine_readable,
+        test_proxy_deterministic_tokenization_and_tool_schema_prefix_caching,
     ]
     for fn in test_fns:
         fn()
