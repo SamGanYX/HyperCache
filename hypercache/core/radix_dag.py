@@ -43,6 +43,8 @@ class BlockReplica:
     created_at: float = field(default_factory=time.monotonic)
     last_accessed: float = field(default_factory=time.monotonic)
     access_count: int = 1
+    modular_key: tuple[str, str] = ("public", "")
+    trie_node: Optional[RadixTreeNode] = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -76,8 +78,10 @@ class RadixTreeNode:
             )
             self.children[causal_hash] = child
         child = self.children[causal_hash]
-        if replica is not None and replica not in child.replicas:
-            child.replicas.append(replica)
+        if replica is not None:
+            if replica not in child.replicas:
+                child.replicas.append(replica)
+            replica.trie_node = child
         return child
 
 
@@ -94,7 +98,7 @@ class RadixTree:
     def insert_sequence(
         self,
         blocks: list[TokenBlock],
-        replicas: list[BlockReplica],
+        replicas: list[Optional[BlockReplica]],
     ) -> list[RadixTreeNode]:
         """Inserts a sequential chain of blocks into the radix tree."""
         current = self.root
@@ -224,6 +228,7 @@ class GlobalRadixDAG:
         self.hotspot_replications = 0
         self.l1_to_l2_demotions = 0
         self.l2_to_l3_demotions = 0
+        self.l3_evictions = 0
 
     def _ensure_node(self, node_id: str) -> None:
         if node_id not in self._node_usage:
@@ -239,11 +244,59 @@ class GlobalRadixDAG:
             self._ensure_node(node_id)
             return dict(self._node_usage[node_id])
 
+    def _purge_replica(
+        self, node_id: str, causal_hash: str, replica: BlockReplica
+    ) -> None:
+        """Completely removes an evicted replica from node maps, indices, and radix trie."""
+        self._node_blocks[node_id].pop(causal_hash, None)
+
+        c_list = self._causal_index.get(causal_hash)
+        if c_list is not None:
+            if replica in c_list:
+                c_list.remove(replica)
+            if not c_list:
+                self._causal_index.pop(causal_hash, None)
+
+        m_list = self._modular_index.get(replica.modular_key)
+        if m_list is not None:
+            if replica in m_list:
+                m_list.remove(replica)
+            if not m_list:
+                self._modular_index.pop(replica.modular_key, None)
+
+        if replica.trie_node is not None and replica in replica.trie_node.replicas:
+            replica.trie_node.replicas.remove(replica)
+            replica.trie_node = None
+
+    def _evict_l3_if_needed(self, node_id: str, required_l3_bytes: int) -> None:
+        usage = self._node_usage[node_id]
+        node_map = self._node_blocks[node_id]
+
+        while usage[MemoryTier.L3_NVME_SSD] + required_l3_bytes > self.l3_capacity:
+            l3_candidates = [
+                (c_hash, rep)
+                for c_hash, rep in node_map.items()
+                if rep.tier == MemoryTier.L3_NVME_SSD
+            ]
+            if not l3_candidates:
+                break
+
+            victim_hash, victim = min(
+                l3_candidates,
+                key=lambda item: (item[1].access_count, item[1].last_accessed),
+            )
+            usage[MemoryTier.L3_NVME_SSD] = max(
+                0, usage[MemoryTier.L3_NVME_SSD] - victim.size_bytes
+            )
+            self._purge_replica(node_id, victim_hash, victim)
+            self.l3_evictions += 1
+
     def _evict_or_demote_if_needed(self, node_id: str, required_l1_bytes: int) -> None:
         """
         Instead of dropping evicted KV blocks like standard vLLM APC, HyperCache
         demotes cold L1 VRAM blocks to L2 Pinned Host RAM (with 2x FP8 compression)
-        and from L2 to L3 NVMe (with 4x INT4 compression).
+        and from L2 to L3 NVMe (with 4x INT4 compression). If lower tiers have 0
+        capacity (e.g. Siloed APC mode), cold blocks are cleanly purged.
         """
         self._ensure_node(node_id)
         usage = self._node_usage[node_id]
@@ -267,7 +320,21 @@ class GlobalRadixDAG:
             usage[MemoryTier.L1_LOCAL_VRAM] -= victim.size_bytes
 
             # Demote to L2 Pinned RAM at 50% size (FP8 quantization)
-            fp8_bytes = victim.size_bytes // 2
+            fp8_bytes = max(1, victim.size_bytes // 2)
+            if self.l2_capacity < fp8_bytes:
+                # L2 is disabled or smaller than a single block -> spill to L3 or purge
+                int4_bytes = max(1, fp8_bytes // 2)
+                if self.l3_capacity < int4_bytes:
+                    self._purge_replica(node_id, victim_hash, victim)
+                    self.l3_evictions += 1
+                else:
+                    self._evict_l3_if_needed(node_id, int4_bytes)
+                    victim.tier = MemoryTier.L3_NVME_SSD
+                    victim.size_bytes = int4_bytes
+                    usage[MemoryTier.L3_NVME_SSD] += int4_bytes
+                    self.l2_to_l3_demotions += 1
+                continue
+
             if usage[MemoryTier.L2_PINNED_RAM] + fp8_bytes > self.l2_capacity:
                 self._demote_l2_to_l3(node_id, fp8_bytes)
 
@@ -289,7 +356,7 @@ class GlobalRadixDAG:
             if not l2_candidates:
                 break
 
-            _, victim = min(
+            victim_hash, victim = min(
                 l2_candidates,
                 key=lambda item: (item[1].access_count, item[1].last_accessed),
             )
@@ -297,11 +364,15 @@ class GlobalRadixDAG:
 
             # Demote to L3 NVMe at 50% of FP8 size (= 25% of BF16 via INT4 packing)
             int4_bytes = max(1, victim.size_bytes // 2)
+            if self.l3_capacity < int4_bytes:
+                self._purge_replica(node_id, victim_hash, victim)
+                self.l3_evictions += 1
+                continue
+
+            self._evict_l3_if_needed(node_id, int4_bytes)
             victim.tier = MemoryTier.L3_NVME_SSD
             victim.size_bytes = int4_bytes
-            usage[MemoryTier.L3_NVME_SSD] = min(
-                self.l3_capacity, usage[MemoryTier.L3_NVME_SSD] + int4_bytes
-            )
+            usage[MemoryTier.L3_NVME_SSD] += int4_bytes
             self.l2_to_l3_demotions += 1
 
     def register_blocks(
@@ -325,6 +396,11 @@ class GlobalRadixDAG:
                     active_replicas.append(existing_rep)
                     continue
 
+                effective_tenant = (
+                    blk.tenant_id if self.hasher.enable_tenant_isolation else "public"
+                )
+                mod_key = (effective_tenant, blk.modular_hash)
+
                 self._evict_or_demote_if_needed(node_id, raw_bytes)
                 replica = BlockReplica(
                     node_id=node_id,
@@ -335,19 +411,19 @@ class GlobalRadixDAG:
                     created_at=now,
                     last_accessed=now,
                     access_count=1,
+                    modular_key=mod_key,
                 )
                 self._node_usage[node_id][MemoryTier.L1_LOCAL_VRAM] += raw_bytes
                 self._node_blocks[node_id][blk.causal_hash] = replica
                 self._causal_index.setdefault(blk.causal_hash, []).append(replica)
-
-                effective_tenant = (
-                    blk.tenant_id if self.hasher.enable_tenant_isolation else "public"
-                )
-                mod_key = (effective_tenant, blk.modular_hash)
                 self._modular_index.setdefault(mod_key, []).append(replica)
                 active_replicas.append(replica)
 
-            self.trie.insert_sequence(blocks, active_replicas)
+            live_replicas: list[Optional[BlockReplica]] = [
+                rep if blk.causal_hash in self._node_blocks[node_id] else None
+                for blk, rep in zip(blocks, active_replicas)
+            ]
+            self.trie.insert_sequence(blocks, live_replicas)
 
     def _select_best_replica(
         self,

@@ -542,6 +542,51 @@ def test_proxy_deterministic_tokenization_and_tool_schema_prefix_caching() -> No
     assert "<|im_start|>tools" in extracted_a
 
 
+def test_radix_dag_zero_tier_capacity_and_l3_eviction_purge() -> None:
+    # 1. Siloed APC mode: L1 holds 1 block (1024 B), L2 = 0, L3 = 0
+    siloed_dag = GlobalRadixDAG(
+        hasher=BlockHasher(block_size=4),
+        l1_capacity_bytes_per_node=1024,
+        l2_capacity_bytes_per_node=0,
+        l3_capacity_bytes_per_node=0,
+        raw_kv_bytes_per_token=256,  # 4 tokens * 256 = 1024 B per block
+    )
+    siloed_dag.lookup_sequence([1, 2, 3, 4], requesting_node="node-1")
+    siloed_dag.lookup_sequence([5, 6, 7, 8], requesting_node="node-1")  # Evicts [1, 2, 3, 4]
+
+    assert siloed_dag.l3_evictions == 1
+    usage = siloed_dag.get_node_usage("node-1")
+    assert usage[MemoryTier.L2_PINNED_RAM] == 0
+    assert usage[MemoryTier.L3_NVME_SSD] == 0
+
+    # Re-querying [1, 2, 3, 4] must be a complete MISS, not a phantom L3 hit
+    plan_evicted = siloed_dag.lookup_sequence(
+        [1, 2, 3, 4], requesting_node="node-1", auto_populate_on_miss=False
+    )
+    assert plan_evicted.block_hits[0].hit_type == "MISS"
+
+    # 2. Bounded L3 capacity mode: L1 = 1024B (1 blk), L2 = 512B (1 FP8 blk), L3 = 256B (1 INT4 blk)
+    bounded_dag = GlobalRadixDAG(
+        hasher=BlockHasher(block_size=4),
+        l1_capacity_bytes_per_node=1024,
+        l2_capacity_bytes_per_node=512,
+        l3_capacity_bytes_per_node=256,
+        raw_kv_bytes_per_token=256,
+    )
+    bounded_dag.lookup_sequence([10, 11, 12, 13], requesting_node="node-1")
+    bounded_dag.lookup_sequence([20, 21, 22, 23], requesting_node="node-1")
+    bounded_dag.lookup_sequence([30, 31, 32, 33], requesting_node="node-1")
+    bounded_dag.lookup_sequence([40, 41, 42, 43], requesting_node="node-1")
+
+    assert bounded_dag.l3_evictions == 1
+    b_usage = bounded_dag.get_node_usage("node-1")
+    assert b_usage[MemoryTier.L3_NVME_SSD] <= 256
+    plan_oldest = bounded_dag.lookup_sequence(
+        [10, 11, 12, 13], requesting_node="node-1", auto_populate_on_miss=False
+    )
+    assert plan_oldest.block_hits[0].hit_type == "MISS"
+
+
 if __name__ == "__main__":
     test_fns = [
         test_causal_chain_vs_modular_hash_and_tenant_isolation,
@@ -560,6 +605,7 @@ if __name__ == "__main__":
         test_singleflight_request_coalescing_and_incast_prevention,
         test_cli_json_export_and_benchmark_machine_readable,
         test_proxy_deterministic_tokenization_and_tool_schema_prefix_caching,
+        test_radix_dag_zero_tier_capacity_and_l3_eviction_purge,
     ]
     for fn in test_fns:
         fn()
