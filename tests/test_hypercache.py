@@ -587,6 +587,36 @@ def test_radix_dag_zero_tier_capacity_and_l3_eviction_purge() -> None:
     assert plan_oldest.block_hits[0].hit_type == "MISS"
 
 
+def test_physical_storage_tier_promotion_dedup_and_l3_disk_lru() -> None:
+    rng = np.random.default_rng(77)
+    k = rng.standard_normal((1, 8, 2, 64), dtype=np.float32)
+    v = rng.standard_normal((1, 8, 2, 64), dtype=np.float32)
+
+    engine = PhysicalTieredStorageEngine(l1_max_blocks=1, l2_max_blocks=1, l3_max_blocks=1)
+    try:
+        # Use namespaced keys containing ':' and '/' to test filename sanitization
+        engine.put_block("tenant:alpha/blk-0", k, v, cached_start_pos=0)
+        engine.put_block("tenant:alpha/blk-1", k, v, cached_start_pos=64)
+        engine.put_block("tenant:alpha/blk-2", k, v, cached_start_pos=128)
+        # Now: blk-2 in L1, blk-1 in L2, blk-0 in L3
+
+        # Promote blk-1 from L2 to L1: blk-1 should move to L1, blk-2 demotes to L2,
+        # and blk-1 must NOT exist in both L1 and L2 simultaneously.
+        res_prom = engine.get_block("tenant:alpha/blk-1", promote_to_l1=True)
+        assert res_prom is not None and res_prom.source_tier == MemoryTier.L2_PINNED_RAM
+        assert "tenant:alpha/blk-1" in engine._l1_store
+        assert "tenant:alpha/blk-1" not in engine._l2_store
+        assert "tenant:alpha/blk-2" in engine._l2_store
+
+        # Insert blk-3 -> pushes blk-1 to L2, blk-2 to L3, evicting blk-0 from L3 disk!
+        engine.put_block("tenant:alpha/blk-3", k, v, cached_start_pos=192)
+        assert engine.l3_evictions == 1
+        assert engine.get_block("tenant:alpha/blk-0") is None
+        assert engine.get_block("tenant:alpha/blk-2") is not None
+    finally:
+        engine.close()
+
+
 if __name__ == "__main__":
     test_fns = [
         test_causal_chain_vs_modular_hash_and_tenant_isolation,
@@ -606,6 +636,7 @@ if __name__ == "__main__":
         test_cli_json_export_and_benchmark_machine_readable,
         test_proxy_deterministic_tokenization_and_tool_schema_prefix_caching,
         test_radix_dag_zero_tier_capacity_and_l3_eviction_purge,
+        test_physical_storage_tier_promotion_dedup_and_l3_disk_lru,
     ]
     for fn in test_fns:
         fn()

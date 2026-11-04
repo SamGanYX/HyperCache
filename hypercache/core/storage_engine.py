@@ -20,6 +20,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 import mmap
 from pathlib import Path
+import re
 import struct
 import tempfile
 import threading
@@ -55,6 +56,7 @@ class PhysicalTieredStorageEngine:
         self,
         l1_max_blocks: int = 32,
         l2_max_blocks: int = 128,
+        l3_max_blocks: int = 1024,
         l3_storage_dir: Optional[Path] = None,
         high_watermark_ratio: float = 0.85,
         low_watermark_ratio: float = 0.70,
@@ -62,6 +64,7 @@ class PhysicalTieredStorageEngine:
     ) -> None:
         self.l1_max_blocks = max(1, l1_max_blocks)
         self.l2_max_blocks = max(1, l2_max_blocks)
+        self.l3_max_blocks = max(1, l3_max_blocks)
         self.high_watermark_ratio = high_watermark_ratio
         self.low_watermark_ratio = low_watermark_ratio
         self.enable_async_eviction = enable_async_eviction
@@ -82,14 +85,15 @@ class PhysicalTieredStorageEngine:
         self._l1_store: OrderedDict[str, tuple[np.ndarray, np.ndarray, int]] = OrderedDict()
         # L2 LRU: block_hash -> QuantizedKVBuffer (FP8_E4M3)
         self._l2_store: OrderedDict[str, QuantizedKVBuffer] = OrderedDict()
-        # L3 Disk Index: block_hash -> Path to `.hckv` binary INT4 file
-        self._l3_index: dict[str, Path] = {}
+        # L3 Disk LRU Index: block_hash -> Path to `.hckv` binary INT4 file
+        self._l3_index: OrderedDict[str, Path] = OrderedDict()
 
         self.l1_hits = 0
         self.l2_hits = 0
         self.l3_hits = 0
         self.l1_to_l2_demotions = 0
         self.l2_to_l3_demotions = 0
+        self.l3_evictions = 0
 
         if self.enable_async_eviction:
             self._eviction_thread = threading.Thread(
@@ -98,6 +102,12 @@ class PhysicalTieredStorageEngine:
                 daemon=True,
             )
             self._eviction_thread.start()
+
+    @staticmethod
+    def _safe_filename(block_hash: str) -> str:
+        """Sanitizes arbitrary block identifiers to prevent path traversal or OS filename errors."""
+        sanitized = re.sub(r"[^a-zA-Z0-9._-]", "_", block_hash)
+        return sanitized or "unnamed_block"
 
     def _background_eviction_loop(self) -> None:
         """Asynchronous daemon that proactively drains L1 and L2 down to low watermarks."""
@@ -162,7 +172,15 @@ class PhysicalTieredStorageEngine:
         self.l1_to_l2_demotions += 1
 
     def _demote_to_l3_disk(self, block_hash: str, fp8_buf: QuantizedKVBuffer) -> None:
-        """Dequantizes FP8 and bit-packs into INT4 on disk with a CRC32 checksum."""
+        """Dequantizes FP8 and bit-packs into INT4 on disk with a CRC32 checksum and LRU bounding."""
+        while len(self._l3_index) >= self.l3_max_blocks:
+            _, oldest_path = self._l3_index.popitem(last=False)
+            try:
+                oldest_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.l3_evictions += 1
+
         k_f32, v_f32 = KVQuantizer.dequantize(fp8_buf)
         int4_buf = KVQuantizer.quantize(
             k_f32,
@@ -171,9 +189,11 @@ class PhysicalTieredStorageEngine:
             cached_start_pos=fp8_buf.cached_start_pos,
         )
         payload = self.serialize_quantized_buffer(int4_buf)
-        file_path = self.l3_dir / f"{block_hash}.hckv"
+        safe_name = self._safe_filename(block_hash)
+        file_path = self.l3_dir / f"{safe_name}.hckv"
         file_path.write_bytes(payload)
         self._l3_index[block_hash] = file_path
+        self._l3_index.move_to_end(block_hash)
         self.l2_to_l3_demotions += 1
 
     def get_block(
@@ -197,12 +217,14 @@ class PhysicalTieredStorageEngine:
 
             # 2. Check L2 (FP8 quantized in-memory pool)
             if block_hash in self._l2_store:
-                self._l2_store.move_to_end(block_hash)
                 fp8_buf = self._l2_store[block_hash]
                 k_f32, v_f32 = KVQuantizer.dequantize(fp8_buf)
                 self.l2_hits += 1
                 if promote_to_l1:
+                    self._l2_store.pop(block_hash, None)
                     self.put_block(block_hash, k_f32, v_f32, fp8_buf.cached_start_pos)
+                else:
+                    self._l2_store.move_to_end(block_hash)
                 return PhysicalFetchResult(
                     block_hash=block_hash,
                     source_tier=MemoryTier.L2_PINNED_RAM,
@@ -227,7 +249,14 @@ class PhysicalTieredStorageEngine:
                         k_f32, v_f32 = KVQuantizer.dequantize(int4_buf)
                         self.l3_hits += 1
                         if promote_to_l1:
+                            self._l3_index.pop(block_hash, None)
+                            try:
+                                file_path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
                             self.put_block(block_hash, k_f32, v_f32, int4_buf.cached_start_pos)
+                        else:
+                            self._l3_index.move_to_end(block_hash)
                         return PhysicalFetchResult(
                             block_hash=block_hash,
                             source_tier=MemoryTier.L3_NVME_SSD,
