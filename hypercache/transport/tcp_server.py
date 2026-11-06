@@ -8,6 +8,7 @@ KV-cache cluster over TCP sockets with wire-speed FP8/INT4 compression and CRC32
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import queue
 import socket
@@ -74,14 +75,17 @@ class _KVRequestHandler(socketserver.BaseRequestHandler):
 
                 if cmd_byte == b"P":
                     payload = _recv_exact(self.request, payload_len)
-                    server.put_raw_frame(key, payload)
-                    self.request.sendall(struct.pack("<B I", 1, 0))
+                    stored = server.put_raw_frame(key, payload)
+                    self.request.sendall(struct.pack("<B I", 1 if stored else 0, 0))
                 elif cmd_byte == b"G":
                     frame = server.get_raw_frame(key)
                     if frame is None:
                         self.request.sendall(struct.pack("<B I", 0, 0))
                     else:
                         self.request.sendall(struct.pack("<B I", 1, len(frame)) + frame)
+                elif cmd_byte == b"D":
+                    removed = server.delete_raw_frame(key)
+                    self.request.sendall(struct.pack("<B I", 1 if removed else 0, 0))
                 else:
                     self.request.sendall(struct.pack("<B I", 0, 0))
         except (ConnectionError, OSError):
@@ -90,21 +94,42 @@ class _KVRequestHandler(socketserver.BaseRequestHandler):
 
 class HyperCacheTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     """
-    Multi-threaded binary KV-block cache server storing compressed FP8/INT4 frames.
+    Multi-threaded binary KV-block cache server storing compressed FP8/INT4 frames
+    with bounded LRU frame and byte capacity enforcement.
     """
 
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 0) -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        max_frames: int = 4096,
+        max_storage_bytes: int = 4 * (1024**3),
+    ) -> None:
         super().__init__((host, port), _KVRequestHandler)
         self._lock = threading.RLock()
-        self._frames: dict[str, bytes] = {}
+        self._frames: OrderedDict[str, bytes] = OrderedDict()
+        self._used_bytes: int = 0
+        self.max_frames: int = max(0, max_frames)
+        self.max_storage_bytes: int = max(0, max_storage_bytes)
+        self.total_puts: int = 0
+        self.total_gets: int = 0
+        self.cache_hits: int = 0
+        self.cache_misses: int = 0
+        self.evictions: int = 0
+        self.rejected_puts: int = 0
         self._thread: Optional[threading.Thread] = None
 
     @property
     def bound_port(self) -> int:
         return int(self.server_address[1])
+
+    @property
+    def used_bytes(self) -> int:
+        with self._lock:
+            return self._used_bytes
 
     def start_background(self) -> None:
         self._thread = threading.Thread(
@@ -118,13 +143,69 @@ class HyperCacheTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         if self._thread is not None:
             self._thread.join(timeout=2.0)
 
-    def put_raw_frame(self, key: str, frame: bytes) -> None:
+    def put_raw_frame(self, key: str, frame: bytes) -> bool:
+        frame_len = len(frame)
         with self._lock:
+            if (
+                self.max_frames <= 0
+                or self.max_storage_bytes <= 0
+                or frame_len > self.max_storage_bytes
+            ):
+                self.rejected_puts += 1
+                return False
+
+            if key in self._frames:
+                old_frame = self._frames.pop(key)
+                self._used_bytes = max(0, self._used_bytes - len(old_frame))
+
+            while self._frames and (
+                len(self._frames) >= self.max_frames
+                or self._used_bytes + frame_len > self.max_storage_bytes
+            ):
+                _, evicted_frame = self._frames.popitem(last=False)
+                self._used_bytes = max(0, self._used_bytes - len(evicted_frame))
+                self.evictions += 1
+
             self._frames[key] = frame
+            self._used_bytes += frame_len
+            self.total_puts += 1
+            return True
 
     def get_raw_frame(self, key: str) -> Optional[bytes]:
         with self._lock:
-            return self._frames.get(key)
+            self.total_gets += 1
+            frame = self._frames.get(key)
+            if frame is None:
+                self.cache_misses += 1
+                return None
+            self._frames.move_to_end(key)
+            self.cache_hits += 1
+            return frame
+
+    def delete_raw_frame(self, key: str) -> bool:
+        with self._lock:
+            old_frame = self._frames.pop(key, None)
+            if old_frame is None:
+                return False
+            self._used_bytes = max(0, self._used_bytes - len(old_frame))
+            return True
+
+    def get_stats(self) -> dict[str, int | float]:
+        with self._lock:
+            total = max(1, self.total_gets)
+            return {
+                "stored_frames": len(self._frames),
+                "used_bytes": self._used_bytes,
+                "max_frames": self.max_frames,
+                "max_storage_bytes": self.max_storage_bytes,
+                "total_puts": self.total_puts,
+                "total_gets": self.total_gets,
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+                "evictions": self.evictions,
+                "rejected_puts": self.rejected_puts,
+                "hit_rate": self.cache_hits / total,
+            }
 
 
 class HyperCacheTCPClient:
@@ -307,6 +388,30 @@ class HyperCacheTCPClient:
             roundtrip_ms=elapsed_ms,
             effective_gbps=gbps,
         )
+
+    def delete_kv_block(self, block_hash: str) -> bool:
+        """Removes a cached KV block from the remote `HyperCacheTCPServer`."""
+        key_bytes = block_hash.encode("utf-8")
+        hdr = struct.pack("<c H I", b"D", len(key_bytes), 0)
+        req = hdr + key_bytes
+        sock = self._acquire_socket()
+        healthy = False
+        try:
+            sock.sendall(req)
+            resp = _recv_exact(sock, 5)
+            status, _ = struct.unpack("<B I", resp)
+            healthy = True
+            return status == 1
+        except (ConnectionError, OSError):
+            healthy = False
+            sock = self._create_socket()
+            sock.sendall(req)
+            resp = _recv_exact(sock, 5)
+            status, _ = struct.unpack("<B I", resp)
+            healthy = True
+            return status == 1
+        finally:
+            self._release_socket(sock, healthy)
 
     def close(self) -> None:
         """Closes all idle pooled connections."""

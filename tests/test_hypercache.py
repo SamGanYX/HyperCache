@@ -667,6 +667,44 @@ def test_vectorized_indexed_rope_rotation_exactness() -> None:
     assert np.max(np.abs(vec_out - loop_out)) < 1e-7
 
 
+def test_tcp_server_bounded_lru_eviction_and_delete() -> None:
+    rng = np.random.default_rng(777)
+    k = rng.standard_normal((1, 8, 2, 64), dtype=np.float32)
+    v = rng.standard_normal((1, 8, 2, 64), dtype=np.float32)
+
+    server = HyperCacheTCPServer(host="127.0.0.1", port=0, max_frames=2, max_storage_bytes=200_000)
+    server.start_background()
+    client = HyperCacheTCPClient(
+        host="127.0.0.1", port=server.bound_port, quant_mode=KVQuantMode.FP8_E4M3, head_dim=64
+    )
+    try:
+        client.put_kv_block("blk-a", k, v, cached_start_pos=0)
+        client.put_kv_block("blk-b", k, v, cached_start_pos=8)
+        # Touch blk-a so blk-b becomes LRU
+        res_a = client.get_kv_block("blk-a")
+        assert res_a.found
+
+        # Inserting blk-c should evict blk-b (LRU) while keeping blk-a
+        client.put_kv_block("blk-c", k, v, cached_start_pos=16)
+        assert not client.get_kv_block("blk-b").found
+        assert client.get_kv_block("blk-a").found
+        assert client.get_kv_block("blk-c").found
+
+        stats = server.get_stats()
+        assert stats["stored_frames"] == 2
+        assert stats["evictions"] == 1
+        assert stats["used_bytes"] > 0
+
+        # Delete blk-a over the wire and verify used_bytes drops
+        assert client.delete_kv_block("blk-a") is True
+        assert client.delete_kv_block("blk-a") is False
+        assert not client.get_kv_block("blk-a").found
+        assert server.get_stats()["stored_frames"] == 1
+    finally:
+        client.close()
+        server.stop()
+
+
 if __name__ == "__main__":
     test_fns = [
         test_causal_chain_vs_modular_hash_and_tenant_isolation,
@@ -689,6 +727,7 @@ if __name__ == "__main__":
         test_physical_storage_tier_promotion_dedup_and_l3_disk_lru,
         test_int4_subchannel_group_quantization_outlier_resilience,
         test_vectorized_indexed_rope_rotation_exactness,
+        test_tcp_server_bounded_lru_eviction_and_delete,
     ]
     for fn in test_fns:
         fn()
