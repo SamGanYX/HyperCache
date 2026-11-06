@@ -705,6 +705,42 @@ def test_tcp_server_bounded_lru_eviction_and_delete() -> None:
         server.stop()
 
 
+def test_vllm_connector_two_phase_register_computed_blocks() -> None:
+    cfg = HyperCacheConfig(node_id="vllm-worker-0", block_size=16)
+    conn = HyperCacheVLLMConnector(config=cfg)
+    tokens = list(range(100, 164))  # 64 tokens = 4 blocks
+
+    # Phase 1: lookup with auto_populate=False (does not register blocks before prefill finishes)
+    res_miss = conn.lookup_and_prefetch(
+        "req-1", tokens, tenant_id="org-x", auto_populate=False
+    )
+    assert res_miss.cached_tokens == 0
+    assert res_miss.recompute_tokens == 64
+
+    # Verify blocks are still uncached before Phase 2 completes
+    res_still_miss = conn.lookup_and_prefetch(
+        "req-2", tokens, tenant_id="org-x", auto_populate=False
+    )
+    assert res_still_miss.cached_tokens == 0
+
+    # Phase 2: publish computed KV blocks after prefill completes
+    n_registered = conn.register_computed_blocks(tokens, tenant_id="org-x", tp_shards=2)
+    assert n_registered == 4
+
+    # Subsequent lookup hits 100% in L1 VRAM
+    res_hit = conn.lookup_and_prefetch(
+        "req-3", tokens, tenant_id="org-x", auto_populate=False
+    )
+    assert res_hit.cached_tokens == 64
+    assert res_hit.exact_causal_tokens == 64
+    assert res_hit.recompute_tokens == 0
+
+    telemetry = conn.cluster_telemetry()
+    assert telemetry["l1_hits"] == 4
+    assert telemetry["trie_max_depth"] == 4
+    assert telemetry["L1_VRAM_GB"] > 0.0
+
+
 if __name__ == "__main__":
     test_fns = [
         test_causal_chain_vs_modular_hash_and_tenant_isolation,
@@ -728,6 +764,7 @@ if __name__ == "__main__":
         test_int4_subchannel_group_quantization_outlier_resilience,
         test_vectorized_indexed_rope_rotation_exactness,
         test_tcp_server_bounded_lru_eviction_and_delete,
+        test_vllm_connector_two_phase_register_computed_blocks,
     ]
     for fn in test_fns:
         fn()

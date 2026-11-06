@@ -153,6 +153,23 @@ class HyperCacheVLLMConnector:
             latency_breakdown=breakdown,
         )
 
+    def register_computed_blocks(
+        self,
+        token_ids: Sequence[int],
+        tenant_id: str = "public",
+        tp_shards: int = 1,
+    ) -> int:
+        """
+        Phase 2 of the vLLM `KVConnectorBase` lifecycle: publishes newly computed KV
+        blocks into this worker node's L1 VRAM and the cluster-wide Global Radix DAG
+        after prefill finishes. Returns the number of KV blocks registered.
+        """
+        blocks = self.hasher.chunk_and_hash(list(token_ids), tenant_id=tenant_id)
+        if not blocks:
+            return 0
+        self.dag.register_blocks(blocks, node_id=self.config.node_id, tp_shards=tp_shards)
+        return len(blocks)
+
     def node_memory_summary_gb(self) -> dict[str, float]:
         """Returns current L1/L2/L3 memory utilization on this worker node in GB."""
         usage = self.dag.get_node_usage(self.config.node_id)
@@ -160,4 +177,23 @@ class HyperCacheVLLMConnector:
             "L1_VRAM_GB": usage[MemoryTier.L1_LOCAL_VRAM] / (1024**3),
             "L2_PINNED_RAM_GB": usage[MemoryTier.L2_PINNED_RAM] / (1024**3),
             "L3_NVME_GB": usage[MemoryTier.L3_NVME_SSD] / (1024**3),
+        }
+
+    def cluster_telemetry(self) -> dict[str, int | float]:
+        """Returns global Radix DAG hit/demotion/eviction telemetry and node memory usage."""
+        trie = self.dag.trie_stats()
+        mem = self.node_memory_summary_gb()
+        return {
+            "total_queries": self.dag.total_queries,
+            "l1_hits": self.dag.l1_hits,
+            "l2_hits": self.dag.l2_hits,
+            "l3_hits": self.dag.l3_hits,
+            "modular_hits": self.dag.modular_hits,
+            "misses": self.dag.misses,
+            "l1_to_l2_demotions": self.dag.l1_to_l2_demotions,
+            "l2_to_l3_demotions": self.dag.l2_to_l3_demotions,
+            "l3_evictions": self.dag.l3_evictions,
+            "trie_nodes": trie["total_nodes"],
+            "trie_max_depth": trie["max_depth"],
+            **mem,
         }

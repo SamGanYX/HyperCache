@@ -225,6 +225,11 @@ class GlobalRadixDAG:
 
         # Telemetry counters
         self.total_queries = 0
+        self.l1_hits = 0
+        self.l2_hits = 0
+        self.l3_hits = 0
+        self.modular_hits = 0
+        self.misses = 0
         self.hotspot_replications = 0
         self.l1_to_l2_demotions = 0
         self.l2_to_l3_demotions = 0
@@ -538,6 +543,12 @@ class GlobalRadixDAG:
                     )
                     tier_counts[eff_tier] += blk.num_tokens
                     exact_tokens += blk.num_tokens
+                    if eff_tier == MemoryTier.L1_LOCAL_VRAM:
+                        self.l1_hits += 1
+                    elif eff_tier == MemoryTier.L3_NVME_SSD:
+                        self.l3_hits += 1
+                    else:
+                        self.l2_hits += 1
                     continue
 
                 # Once a causal block misses, downstream blocks cannot be exact causal matches
@@ -571,6 +582,13 @@ class GlobalRadixDAG:
                     )
                     tier_counts[eff_tier] += blk.num_tokens
                     modular_tokens += blk.num_tokens
+                    self.modular_hits += 1
+                    if eff_tier == MemoryTier.L1_LOCAL_VRAM:
+                        self.l1_hits += 1
+                    elif eff_tier == MemoryTier.L3_NVME_SSD:
+                        self.l3_hits += 1
+                    else:
+                        self.l2_hits += 1
                     continue
 
                 # 3. Complete Cache Miss -> Compute on GPU
@@ -587,6 +605,7 @@ class GlobalRadixDAG:
                 )
                 tier_counts[MemoryTier.MISS] += blk.num_tokens
                 recompute_tokens += blk.num_tokens
+                self.misses += 1
 
             if auto_populate_on_miss:
                 self.register_blocks(blocks, node_id=requesting_node)
