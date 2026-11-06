@@ -651,6 +651,22 @@ def test_int4_subchannel_group_quantization_outlier_resilience() -> None:
     assert KVQuantizer.cosine_similarity(k[:, 4:12], k_sliced) > 0.985
 
 
+def test_vectorized_indexed_rope_rotation_exactness() -> None:
+    rng = np.random.default_rng(2026)
+    rotator = RoPEPhaseRotator(head_dim=64)
+    k_sub = rng.standard_normal((12, 4, 64), dtype=np.float32)
+    positions = np.array([0, 3, 7, 15, 31, 64, 65, 100, 128, 255, 512, 1024], dtype=np.int64)
+
+    vec_out = rotator.apply_indexed_rope(k_sub, positions)
+    loop_out = np.empty_like(k_sub)
+    for i, pos in enumerate(positions):
+        loop_out[i] = rotator.apply_absolute_rope(k_sub[i : i + 1][None, ...], start_pos=int(pos))[
+            0, 0
+        ]
+
+    assert np.max(np.abs(vec_out - loop_out)) < 1e-7
+
+
 if __name__ == "__main__":
     test_fns = [
         test_causal_chain_vs_modular_hash_and_tenant_isolation,
@@ -672,6 +688,7 @@ if __name__ == "__main__":
         test_radix_dag_zero_tier_capacity_and_l3_eviction_purge,
         test_physical_storage_tier_promotion_dedup_and_l3_disk_lru,
         test_int4_subchannel_group_quantization_outlier_resilience,
+        test_vectorized_indexed_rope_rotation_exactness,
     ]
     for fn in test_fns:
         fn()

@@ -135,16 +135,10 @@ class MiniGQATransformer:
             n_act, self.num_kv_heads, self.head_dim
         )
 
-        # Apply exact absolute RoPE at `start_pos + abs_idx` for each active token
-        q_sub_rope = np.empty_like(q_sub)
-        for local_i, abs_idx in enumerate(active_indices):
-            pos = start_pos + int(abs_idx)
-            q_sub_rope[local_i] = self.rotator.apply_absolute_rope(
-                q_sub[local_i : local_i + 1][None, ...], start_pos=pos
-            )[0, 0]
-            k_rope[abs_idx] = self.rotator.apply_absolute_rope(
-                k_sub[local_i : local_i + 1][None, ...], start_pos=pos
-            )[0, 0]
+        # Apply exact absolute RoPE at `start_pos + abs_idx` for each active token in one vectorized op
+        abs_positions = start_pos + np.asarray(active_indices, dtype=np.int64)
+        q_sub_rope = self.rotator.apply_indexed_rope(q_sub, abs_positions)
+        k_rope[active_indices] = self.rotator.apply_indexed_rope(k_sub, abs_positions)
         v_final[active_indices] = v_sub
 
         # 2. Expand KV heads to match Q heads for GQA across all sequence keys [0..seq_len-1]

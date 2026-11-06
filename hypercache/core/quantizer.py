@@ -345,6 +345,33 @@ class RoPEPhaseRotator:
         out[..., 1::2] = k_even * sin_a + k_odd * cos_a
         return out
 
+    def apply_indexed_rope(
+        self,
+        k_pre_rope: np.ndarray,
+        positions: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Applies Rotary Position Embedding (RoPE) at arbitrary non-contiguous 1D token
+        indices `positions` of shape `(n_act,)` for a tensor of shape
+        `(..., n_act, num_kv_heads, head_dim)` in a single vectorized operation.
+        """
+        pos_arr = np.asarray(positions, dtype=np.float64)
+        if pos_arr.ndim != 1 or pos_arr.shape[0] != k_pre_rope.shape[-3]:
+            raise ValueError(
+                f"positions must be a 1D array matching sequence axis {k_pre_rope.shape[-3]}"
+            )
+        angles = pos_arr[:, None, None] * self.inv_freq[None, None, :]  # (n_act, 1, head_dim // 2)
+        cos_a = np.cos(angles).astype(k_pre_rope.dtype)
+        sin_a = np.sin(angles).astype(k_pre_rope.dtype)
+
+        k_even = k_pre_rope[..., 0::2]
+        k_odd = k_pre_rope[..., 1::2]
+
+        out = np.empty_like(k_pre_rope)
+        out[..., 0::2] = k_even * cos_a - k_odd * sin_a
+        out[..., 1::2] = k_even * sin_a + k_odd * cos_a
+        return out
+
     def shift_positions(
         self,
         k_cached: np.ndarray,
